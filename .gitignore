@@ -1,0 +1,19 @@
+# Editors
+.vscode/
+.idea/
+*.iml
+
+# Dependencies and generated plugin artifacts
+node_modules/
+.direnv/
+main.js
+*.map
+
+# Per-vault/local plugin state and credentials
+data.json
+
+# Test and coverage output
+coverage/
+
+# OS files
+.DS_Store

@@ -1,0 +1,43 @@
+{
+	"name": "kikijiki-voice-journal",
+	"version": "0.1.0",
+	"description": "Local-first voice journaling for Obsidian.",
+	"main": "main.js",
+	"type": "module",
+	"scripts": {
+		"setup": "npm install",
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"check": "npm run build && npm run lint && npm test && git diff --check",
+		"lint": "eslint .",
+		"test": "vitest run --exclude '**/.direnv/**'",
+		"audit-production": "npm audit --omit=dev",
+		"version": "node version-bump.mjs && git add manifest.json versions.json"
+	},
+	"keywords": [
+		"obsidian",
+		"voice-journal",
+		"speech-to-text"
+	],
+	"author": "Matteo Bernacchia <dev@kikijiki.com>",
+	"license": "MIT",
+	"devDependencies": {
+		"@eslint/js": "^9.39.4",
+		"@types/node": "^22.15.17",
+		"esbuild": "0.25.5",
+		"eslint": "^9.39.4",
+		"eslint-plugin-obsidianmd": "^0.4.0",
+		"globals": "^17.6.0",
+		"jiti": "^2.6.1",
+		"obsidian": "latest",
+		"typescript": "^5.8.3",
+		"typescript-eslint": "^8.59.1",
+		"vitest": "^4.1.11"
+	},
+	"allowScripts": {
+		"esbuild@0.25.5": true
+	},
+	"dependencies": {
+		"diff": "^9.0.0"
+	}
+}

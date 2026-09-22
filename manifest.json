@@ -1,0 +1,10 @@
+{
+	"id": "kikijiki-voice-journal",
+	"name": "Kikijiki Voice Journal",
+	"version": "0.1.0",
+	"minAppVersion": "1.13.0",
+	"description": "Imports voice recordings and turns them into traceable journal notes using configurable local AI services.",
+	"author": "KIKIJIKI",
+	"authorUrl": "https://github.com/kikijiki",
+	"isDesktopOnly": true
+}
