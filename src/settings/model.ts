@@ -1,6 +1,5 @@
 import type {
 	CodingAgentType,
-	ConnectionProfile,
 	PersistedPluginData,
 	RecordingSource,
 	RecordingStage,
@@ -8,38 +7,34 @@ import type {
 	RecordingTimestampSource,
 	RuntimeState,
 	StartupMode,
+	SttProviderType,
 	VoiceJournalSettings,
 } from '../model';
 import { PLUGIN_DATA_SCHEMA_VERSION } from '../model';
 import { DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX } from '../ingest/recording-timestamp';
 
-const DEFAULT_PROFILE: ConnectionProfile = {
-	id: 'default',
-	label: 'Configure speech-to-text',
-	sttBaseUrl: '',
-	sttApiKey: '',
-	networkScope: 'unknown',
-};
-
 export const DEFAULT_SETTINGS: VoiceJournalSettings = {
 	schemaVersion: PLUGIN_DATA_SCHEMA_VERSION,
 	startupMode: 'off',
 	startupDelayMs: 3000,
-	activeConnectionProfileId: DEFAULT_PROFILE.id,
-	connectionProfiles: [DEFAULT_PROFILE],
+	sttProvider: 'custom',
+	sttBaseUrl: '',
+	sttApiKey: '',
+	sttModel: '',
+	sttSplitLongRecordings: true,
+	ffmpegExecutable: 'ffmpeg',
 	recordingSources: [],
 	recordingGrouping: 'day',
 	journalDirectory: 'Journal',
+	hideSourcesProperty: true,
 	codingAgentType: 'pi',
 	codingAgentExecutable: 'pi',
-	codingAgentProfile: '',
 	codingAgentModel: '',
 	codingAgentThinkingEnabled: false,
 	codingAgentTimeoutSeconds: 0,
 	agentAddNewEntries: true,
 	agentUpdateExistingEntries: true,
 	additionalAgentInstructions: '',
-	sttModel: '',
 	artifactCacheMaxMb: 5_120,
 	maxEntriesPerScan: 10_000,
 };
@@ -111,6 +106,10 @@ function parseTimestampSource(value: unknown): RecordingTimestampSource {
 	return value === 'filesystem' ? 'filesystem' : 'filename';
 }
 
+function parseSttProvider(value: unknown): SttProviderType {
+	return value === 'openrouter' ? 'openrouter' : 'custom';
+}
+
 function parseRecordingGrouping(value: unknown): RecordingGrouping {
 	return value === 'day' ||
 		value === 'week' ||
@@ -122,39 +121,25 @@ function parseRecordingGrouping(value: unknown): RecordingGrouping {
 			: DEFAULT_SETTINGS.recordingGrouping;
 }
 
-function parseProfiles(value: unknown): ConnectionProfile[] {
-	if (!Array.isArray(value)) {
-		return DEFAULT_SETTINGS.connectionProfiles.map((profile) => ({ ...profile }));
+/**
+ * Versions before flat speech-to-text settings stored a `connectionProfiles`
+ * array with an `activeConnectionProfileId`. Existing installs still have
+ * that shape on disk, so their configured endpoint and API key are recovered
+ * from the previously active profile instead of being silently dropped.
+ */
+function legacyActiveConnectionProfile(
+	settingsValue: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	if (!Array.isArray(settingsValue.connectionProfiles)) {
+		return undefined;
 	}
-
-	const profiles = value.flatMap((entry): ConnectionProfile[] => {
-		if (!isRecord(entry)) {
-			return [];
-		}
-		const id = readString(entry.id, '').trim();
-		if (id === '') {
-			return [];
-		}
-		const scope = entry.networkScope;
-		return [
-			{
-				id,
-				label: readString(entry.label, id),
-				sttBaseUrl: readString(entry.sttBaseUrl, ''),
-				sttApiKey: readString(entry.sttApiKey, ''),
-				networkScope:
-					scope === 'loopback' ||
-					scope === 'private-network' ||
-					scope === 'public-network'
-						? scope
-						: 'unknown',
-			},
-		];
-	});
-
-	return profiles.length > 0
-		? profiles
-		: DEFAULT_SETTINGS.connectionProfiles.map((profile) => ({ ...profile }));
+	const profiles = settingsValue.connectionProfiles.filter(isRecord);
+	const activeId = settingsValue.activeConnectionProfileId;
+	const active =
+		typeof activeId === 'string'
+			? profiles.find((profile) => profile.id === activeId)
+			: undefined;
+	return active ?? profiles[0];
 }
 
 function parseSources(value: unknown): RecordingSource[] {
@@ -280,6 +265,11 @@ function parseRecordings(value: unknown): RuntimeState['recordings'] {
 						stage,
 						sourcePath: readString(entry.sourcePath, ''),
 						fileName: readString(entry.fileName, ''),
+						size: typeof entry.size === 'number' ? entry.size : undefined,
+						sourceModifiedAtMs:
+							typeof entry.sourceModifiedAtMs === 'number'
+								? entry.sourceModifiedAtMs
+								: undefined,
 						archivedAudioPath:
 							typeof entry.archivedAudioPath === 'string'
 								? entry.archivedAudioPath
@@ -306,24 +296,11 @@ function parseRecordings(value: unknown): RuntimeState['recordings'] {
 export function parsePluginData(value: unknown): PersistedPluginData {
 	const root = isRecord(value) ? value : {};
 	const settingsValue = isRecord(root.settings) ? root.settings : {};
-	const profiles = parseProfiles(settingsValue.connectionProfiles);
-	const requestedActiveProfile = readString(
-		settingsValue.activeConnectionProfileId,
-		profiles[0]?.id ?? DEFAULT_PROFILE.id,
-	);
-	const activeProfileId = profiles.some(
-		(profile) => profile.id === requestedActiveProfile,
-	)
-		? requestedActiveProfile
-		: (profiles[0]?.id ?? DEFAULT_PROFILE.id);
+	const legacyProfile = legacyActiveConnectionProfile(settingsValue);
 	const codingAgentType = parseCodingAgentType(settingsValue.codingAgentType);
 	const configuredExecutable = readString(
 		settingsValue.codingAgentExecutable,
 		DEFAULT_AGENT_EXECUTABLES[codingAgentType],
-	);
-	const configuredProfile = readString(
-		settingsValue.codingAgentProfile,
-		'',
 	);
 	const settings: VoiceJournalSettings = {
 		schemaVersion: PLUGIN_DATA_SCHEMA_VERSION,
@@ -332,8 +309,21 @@ export function parsePluginData(value: unknown): PersistedPluginData {
 			0,
 			readNumber(settingsValue.startupDelayMs, DEFAULT_SETTINGS.startupDelayMs),
 		),
-		activeConnectionProfileId: activeProfileId,
-		connectionProfiles: profiles,
+		sttProvider: parseSttProvider(
+			settingsValue.sttProvider ?? legacyProfile?.sttProvider,
+		),
+		sttBaseUrl: readString(
+			settingsValue.sttBaseUrl ?? legacyProfile?.sttBaseUrl,
+			DEFAULT_SETTINGS.sttBaseUrl,
+		),
+		sttApiKey: readString(
+			settingsValue.sttApiKey ?? legacyProfile?.sttApiKey,
+			DEFAULT_SETTINGS.sttApiKey,
+		),
+		sttSplitLongRecordings: readBoolean(
+			settingsValue.sttSplitLongRecordings,
+			DEFAULT_SETTINGS.sttSplitLongRecordings,
+		),
 		recordingSources: parseSources(settingsValue.recordingSources),
 		recordingGrouping: parseRecordingGrouping(settingsValue.recordingGrouping),
 		journalDirectory:
@@ -343,9 +333,12 @@ export function parsePluginData(value: unknown): PersistedPluginData {
 					DEFAULT_SETTINGS.journalDirectory,
 				),
 			) || DEFAULT_SETTINGS.journalDirectory,
+		hideSourcesProperty: readBoolean(
+			settingsValue.hideSourcesProperty,
+			DEFAULT_SETTINGS.hideSourcesProperty,
+		),
 		codingAgentType,
 		codingAgentExecutable: configuredExecutable,
-		codingAgentProfile: configuredProfile,
 		codingAgentModel: readString(
 			settingsValue.codingAgentModel,
 			DEFAULT_SETTINGS.codingAgentModel,
@@ -376,6 +369,10 @@ export function parsePluginData(value: unknown): PersistedPluginData {
 			DEFAULT_SETTINGS.additionalAgentInstructions,
 		),
 		sttModel: readString(settingsValue.sttModel, ''),
+		ffmpegExecutable: readString(
+			settingsValue.ffmpegExecutable,
+			DEFAULT_SETTINGS.ffmpegExecutable,
+		),
 		artifactCacheMaxMb: Math.max(
 			1,
 			Math.floor(
@@ -405,14 +402,4 @@ export function parsePluginData(value: unknown): PersistedPluginData {
 		settings,
 		runtime: { lastRun, recordings },
 	};
-}
-
-export function getActiveProfile(
-	settings: VoiceJournalSettings,
-): ConnectionProfile | null {
-	return (
-		settings.connectionProfiles.find(
-			(profile) => profile.id === settings.activeConnectionProfileId,
-		) ?? null
-	);
 }

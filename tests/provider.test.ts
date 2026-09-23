@@ -61,4 +61,30 @@ describe('OpenAiCompatibleProvider', () => {
 		expect(headers[0]).toEqual({ Authorization: 'Bearer secret-token' });
 		expect(headers[1]).toBeUndefined();
 	});
+
+	it('lists model identifiers, applying an optional query filter', async () => {
+		const urls: string[] = [];
+		const provider = new OpenAiCompatibleProvider(async (request) => {
+			urls.push(typeof request === 'string' ? request : request.url);
+			return response(200, {
+				data: [{ id: 'openai/whisper-1' }, { id: 'not-a-model' }],
+			});
+		});
+		const models = await provider.listModels(
+			'http://127.0.0.1:8000/v1',
+			'secret-token',
+			{ output_modalities: 'transcription' },
+		);
+		expect(models).toEqual(['openai/whisper-1', 'not-a-model']);
+		expect(urls[0]).toBe(
+			'http://127.0.0.1:8000/v1/models?output_modalities=transcription',
+		);
+	});
+
+	it('throws when model discovery receives a non-success response', async () => {
+		const provider = new OpenAiCompatibleProvider(async () => response(401, {}));
+		await expect(
+			provider.listModels('http://127.0.0.1:8000/v1'),
+		).rejects.toThrow(/401/);
+	});
 });

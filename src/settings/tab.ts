@@ -3,20 +3,23 @@ import type {
 	App,
 	Plugin,
 	SettingDefinitionItem,
+	SettingDefinitionList,
+	SettingDefinitionPage,
 	SettingGroupItem,
 } from 'obsidian';
 import type {
 	CodingAgentType,
-	ConnectionProfile,
-	NetworkScope,
 	RecordingSource,
 	RecordingGrouping,
 	RecordingTimestampSource,
 	StartupMode,
+	SttProviderType,
 	VoiceJournalSettings,
 } from '../model';
-import { DEFAULT_AGENT_EXECUTABLES, getActiveProfile, normalizeVaultRelativePath } from './model';
+import { DEFAULT_AGENT_EXECUTABLES, normalizeVaultRelativePath } from './model';
 import { DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX } from '../ingest/recording-timestamp';
+import { OPENROUTER_STT_BASE_URL } from '../providers/openrouter';
+import { VOICE_JOURNAL_SOURCES_PROPERTY } from '../pipeline/recording-processor';
 
 export interface SettingsHost {
 	settings: VoiceJournalSettings;
@@ -24,6 +27,7 @@ export interface SettingsHost {
 	checkCodingAgent: () => Promise<void>;
 	listCodingAgentModels: () => Promise<string[]>;
 	checkStt: () => Promise<void>;
+	listSttModels: () => Promise<string[]>;
 }
 
 function createId(prefix: string): string {
@@ -34,6 +38,10 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 	private codingAgentModels: string[] = [];
 	private modelDiscoveryKey = '';
 	private modelDiscoveryState: 'idle' | 'loading' | 'loaded' | 'failed' = 'idle';
+	private sttModels: string[] = [];
+	private sttModelDiscoveryKey = '';
+	private sttModelDiscoveryState: 'idle' | 'loading' | 'loaded' | 'failed' =
+		'idle';
 
 	constructor(
 		app: App,
@@ -48,14 +56,20 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 			{ type: 'group', heading: 'Triggers', items: this.triggerDefinitions() },
 			{
 				type: 'group',
-				heading: 'Coding agent and speech-to-text',
-				items: this.connectionDefinitions(),
+				heading: 'Coding agent',
+				items: this.codingAgentDefinitions(),
+			},
+			{
+				type: 'group',
+				heading: 'Speech-to-text',
+				items: this.sttDefinitions(),
 			},
 			{
 				type: 'group',
 				heading: 'Recording sources',
-				items: this.sourceDefinitions(),
+				items: this.recordingSourcesGroup(),
 			},
+			this.recordingSourcesList(),
 			{
 				type: 'group',
 				heading: 'Journal',
@@ -105,15 +119,8 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 		];
 	}
 
-	private connectionDefinitions(): SettingGroupItem[] {
+	private codingAgentDefinitions(): SettingGroupItem[] {
 		this.ensureCodingAgentModels();
-		const profileOptions = Object.fromEntries(
-			this.host.settings.connectionProfiles.map((profile) => [
-				profile.id,
-				profile.label,
-			]),
-		);
-		const activeProfile = getActiveProfile(this.host.settings);
 		const definitions: SettingGroupItem[] = [
 			{
 				name: 'Coding agent',
@@ -139,7 +146,6 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 										DEFAULT_AGENT_EXECUTABLES[next];
 								}
 								this.host.settings.codingAgentType = next;
-								this.host.settings.codingAgentProfile = '';
 								this.host.settings.codingAgentModel = '';
 								this.invalidateCodingAgentModels();
 								await this.host.saveSettings();
@@ -148,7 +154,7 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 					);
 				},
 			},
-			this.profileTextDefinition(
+			this.textFieldDefinition(
 				'Coding-agent executable',
 				this.host.settings.codingAgentExecutable,
 				async (value) => {
@@ -159,24 +165,6 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 				},
 			),
 		];
-
-		if (
-			this.host.settings.codingAgentType === 'claude' ||
-			this.host.settings.codingAgentType === 'codex'
-		) {
-			definitions.push(
-				this.profileTextDefinition(
-					this.host.settings.codingAgentType === 'codex'
-						? 'Coding-agent profile'
-						: 'Coding-agent agent',
-					this.host.settings.codingAgentProfile,
-					async (value) => {
-						this.host.settings.codingAgentProfile = value;
-						await this.host.saveSettings();
-					},
-				),
-			);
-		}
 
 		definitions.push(
 			{
@@ -270,49 +258,164 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 					});
 				},
 			},
+		);
+		return definitions;
+	}
+
+	private sttDefinitions(): SettingGroupItem[] {
+		this.ensureSttModels();
+		const settings = this.host.settings;
+		const definitions: SettingGroupItem[] = [
 			{
-				name: 'Speech-to-text profile',
-				desc: 'The plugin never fails over to another profile automatically.',
+				name: 'Provider',
+				desc: 'OpenRouter uses a fixed endpoint, sends audio as base64 JSON (larger uploads than the standard multipart format), and lists ASR-capable models from its catalog using your API key.',
 				render: (setting) => {
 					setting.addDropdown((dropdown) =>
 						dropdown
-							.addOptions(profileOptions)
-							.setValue(this.host.settings.activeConnectionProfileId)
+							.addOptions({
+								custom: 'Custom endpoint',
+								openrouter: 'OpenRouter',
+							})
+							.setValue(settings.sttProvider)
 							.onChange(async (value) => {
-								this.host.settings.activeConnectionProfileId = value;
+								settings.sttProvider = value as SttProviderType;
+								if (settings.sttProvider === 'openrouter') {
+									settings.sttBaseUrl = OPENROUTER_STT_BASE_URL;
+								}
+								this.invalidateSttModels();
 								await this.host.saveSettings();
 								this.update();
 							}),
 					);
 				},
 			},
-		);
+		];
 
-		if (activeProfile !== null) {
-			definitions.push(...this.activeProfileDefinitions(activeProfile));
+		if (settings.sttProvider === 'custom') {
+			definitions.push(
+				this.textFieldDefinition('Base URL', settings.sttBaseUrl, async (value) => {
+					settings.sttBaseUrl = value;
+					this.invalidateSttModels();
+					await this.host.saveSettings();
+				}),
+			);
+		} else {
+			definitions.push({
+				name: 'Base URL',
+				desc: 'Fixed OpenRouter endpoint.',
+				render: (setting) => {
+					setting.addText((text) => {
+						text.setValue(OPENROUTER_STT_BASE_URL).setDisabled(true);
+					});
+				},
+			});
 		}
 
-		definitions.push({
-			name: 'Add connection profile',
-			desc: 'Create another speech-to-text endpoint profile.',
-			render: (setting) => {
-				setting.addButton((button) =>
-					button.setButtonText('Add profile').onClick(async () => {
-						const id = createId('profile');
-						this.host.settings.connectionProfiles.push({
-							id,
-							label: 'New connection',
-							sttBaseUrl: '',
-							sttApiKey: '',
-							networkScope: 'unknown',
-						});
-						this.host.settings.activeConnectionProfileId = id;
-						await this.host.saveSettings();
-						this.update();
-					}),
-				);
+		definitions.push(
+			{
+				name: 'API key',
+				desc: 'Bearer token sent to the speech-to-text endpoint. Leave blank when the endpoint requires no authentication.',
+				render: (setting) => {
+					setting.addText((text) => {
+						text.inputEl.type = 'password';
+						return text
+							.setPlaceholder('Optional')
+							.setValue(settings.sttApiKey)
+							.onChange(async (value) => {
+								settings.sttApiKey = value.trim();
+								this.invalidateSttModels();
+								await this.host.saveSettings();
+							});
+					});
+				},
 			},
-		});
+			{
+				name: 'Model',
+				desc:
+					this.sttModelDiscoveryState === 'failed'
+						? 'Models could not be enumerated. The current value is preserved; use Refresh to try again.'
+						: settings.sttProvider === 'openrouter'
+							? 'ASR-capable models reported by OpenRouter for your API key. Leave blank to use the only model returned.'
+							: 'Models reported by the endpoint’s /models. Leave blank to use the only model returned.',
+				render: (setting) => {
+					setting.settingEl.addClass(
+						'voice-journal-setting--stacked-control',
+					);
+					const configured = settings.sttModel;
+					const models =
+						configured === '' || this.sttModels.includes(configured)
+							? this.sttModels
+							: [configured, ...this.sttModels];
+					setting
+						.addDropdown((dropdown) => {
+							dropdown.selectEl.addClass(
+								'voice-journal-setting-control--model',
+							);
+							return dropdown
+								.addOption('', 'Provider default')
+								.addOptions(
+									Object.fromEntries(models.map((model) => [model, model])),
+								)
+								.setValue(configured)
+								.onChange(async (value) => {
+									settings.sttModel = value;
+									await this.host.saveSettings();
+								});
+						})
+						.addButton((button) =>
+							button
+								.setButtonText(
+									this.sttModelDiscoveryState === 'loading'
+										? 'Loading…'
+										: 'Refresh',
+								)
+								.setDisabled(this.sttModelDiscoveryState === 'loading')
+								.onClick(async () => this.refreshSttModels(true)),
+						)
+						.addButton((button) =>
+							button.setButtonText('Test').onClick(async () => {
+								try {
+									await this.host.checkStt();
+								} catch (error) {
+									new Notice(
+										error instanceof Error
+											? error.message
+											: 'Provider test failed.',
+									);
+								}
+							}),
+						);
+				},
+			},
+			{
+				name: 'Split long recordings',
+				desc: 'Splits recordings larger than about 20 MB or longer than 5 minutes into parts with ffmpeg, transcribes each part, and stitches the text back together. Uses OpenRouter’s request limits for every provider, including local servers.',
+				render: (setting) => {
+					setting.addToggle((toggle) =>
+						toggle
+							.setValue(settings.sttSplitLongRecordings)
+							.onChange(async (value) => {
+								settings.sttSplitLongRecordings = value;
+								await this.host.saveSettings();
+							}),
+					);
+				},
+			},
+			{
+				name: 'ffmpeg executable',
+				desc: 'Used to read recording durations and split long recordings. Only needed when splitting is on.',
+				render: (setting) => {
+					setting.addText((text) =>
+						text
+							.setValue(settings.ffmpegExecutable)
+							.onChange(async (value) => {
+								settings.ffmpegExecutable = value.trim();
+								await this.host.saveSettings();
+							}),
+					);
+				},
+			},
+		);
 		return definitions;
 	}
 
@@ -368,113 +471,60 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private activeProfileDefinitions(
-		profile: ConnectionProfile,
-	): SettingGroupItem[] {
-		return [
-			this.profileTextDefinition('Profile name', profile.label, async (value) => {
-				profile.label = value;
-				await this.host.saveSettings();
-			}),
-			this.profileTextDefinition(
-				'Speech-to-text base URL',
-				profile.sttBaseUrl,
-				async (value) => {
-					profile.sttBaseUrl = value;
-					await this.host.saveSettings();
-				},
-			),
-			{
-				name: 'Speech-to-text API key',
-				desc: 'Bearer token sent to the speech-to-text endpoint. Leave blank when the endpoint requires no authentication.',
-				render: (setting) => {
-					setting.addText((text) => {
-						text.inputEl.type = 'password';
-						return text
-							.setPlaceholder('Optional')
-							.setValue(profile.sttApiKey)
-							.onChange(async (value) => {
-								profile.sttApiKey = value.trim();
-								await this.host.saveSettings();
-							});
-					});
-				},
-			},
-			{
-				name: 'Speech-to-text network scope',
-				desc: 'Audio is sent to this destination for transcription.',
-				render: (setting) => {
-					setting.addDropdown((dropdown) =>
-						dropdown
-							.addOptions({
-								loopback: 'Loopback',
-								'private-network': 'Private network',
-								'public-network': 'Public network',
-								unknown: 'Unknown',
-							})
-							.setValue(profile.networkScope)
-							.onChange(async (value) => {
-								profile.networkScope = value as NetworkScope;
-								await this.host.saveSettings();
-							}),
-					);
-				},
-			},
-			{
-				name: 'Speech-to-text model',
-				desc: 'Leave blank to use the only model returned by /models.',
-				render: (setting) => {
-					setting
-						.addText((text) =>
-							text
-								.setPlaceholder('Model ID')
-								.setValue(this.host.settings.sttModel)
-								.onChange(async (value) => {
-									this.host.settings.sttModel = value.trim();
-									await this.host.saveSettings();
-								}),
-						)
-						.addButton((button) =>
-							button.setButtonText('Test').onClick(async () => {
-								try {
-									await this.host.checkStt();
-								} catch (error) {
-									new Notice(
-										error instanceof Error
-											? error.message
-											: 'Provider test failed.',
-									);
-								}
-							}),
-						);
-				},
-			},
-			{
-				name: 'Remove active profile',
-				desc: 'At least one connection profile must remain.',
-				render: (setting) => {
-					setting.addButton((button) =>
-						button
-							.setButtonText('Remove')
-							.setDestructive()
-							.setDisabled(this.host.settings.connectionProfiles.length <= 1)
-							.onClick(async () => {
-								this.host.settings.connectionProfiles =
-									this.host.settings.connectionProfiles.filter(
-										(candidate) => candidate.id !== profile.id,
-									);
-								this.host.settings.activeConnectionProfileId =
-									this.host.settings.connectionProfiles[0]?.id ?? '';
-								await this.host.saveSettings();
-								this.update();
-							}),
-					);
-				},
-			},
-		];
+	private currentSttModelDiscoveryKey(): string {
+		const settings = this.host.settings;
+		return `${settings.sttProvider}\0${settings.sttBaseUrl}\0${settings.sttApiKey}`;
 	}
 
-	private profileTextDefinition(
+	private invalidateSttModels(): void {
+		this.sttModelDiscoveryKey = '';
+		this.sttModelDiscoveryState = 'idle';
+		this.sttModels = [];
+	}
+
+	private ensureSttModels(): void {
+		const key = this.currentSttModelDiscoveryKey();
+		if (
+			this.sttModelDiscoveryKey === key &&
+			this.sttModelDiscoveryState !== 'idle'
+		) {
+			return;
+		}
+		void this.refreshSttModels(false);
+	}
+
+	private async refreshSttModels(showFailure: boolean): Promise<void> {
+		const key = this.currentSttModelDiscoveryKey();
+		this.sttModelDiscoveryKey = key;
+		this.sttModelDiscoveryState = 'loading';
+		try {
+			const models = await this.host.listSttModels();
+			if (this.currentSttModelDiscoveryKey() !== key) {
+				return;
+			}
+			this.sttModels = models;
+			this.sttModelDiscoveryState = 'loaded';
+		} catch (error) {
+			if (this.currentSttModelDiscoveryKey() !== key) {
+				return;
+			}
+			this.sttModels = [];
+			this.sttModelDiscoveryState = 'failed';
+			if (showFailure) {
+				new Notice(
+					error instanceof Error
+						? error.message
+						: 'Could not load speech-to-text models.',
+				);
+			}
+		} finally {
+			if (this.currentSttModelDiscoveryKey() === key) {
+				this.update();
+			}
+		}
+	}
+
+	private textFieldDefinition(
 		name: string,
 		value: string,
 		onChange: (value: string) => Promise<void>,
@@ -491,33 +541,36 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 		};
 	}
 
-	private sourceDefinitions(): SettingGroupItem[] {
-		const definitions = this.host.settings.recordingSources.flatMap(
-			(source) => this.sourceDefinition(source),
-		);
-		definitions.push({
-			name: 'Maximum scan entries',
-			desc: 'Safety limit across files and folders in one scan.',
-			render: (setting) => {
-				setting.addText((text) =>
-					text
-						.setValue(this.host.settings.maxEntriesPerScan.toString())
-						.onChange(async (value) => {
-							const maximum = Number.parseInt(value, 10);
-							if (Number.isFinite(maximum) && maximum >= 1) {
-								this.host.settings.maxEntriesPerScan = maximum;
-								await this.host.saveSettings();
-							}
-						}),
-				);
+	private recordingSourcesGroup(): SettingGroupItem[] {
+		return [
+			{
+				name: 'Maximum scan entries',
+				desc: 'Safety limit across files and folders in one scan.',
+				render: (setting) => {
+					setting.addText((text) =>
+						text
+							.setValue(this.host.settings.maxEntriesPerScan.toString())
+							.onChange(async (value) => {
+								const maximum = Number.parseInt(value, 10);
+								if (Number.isFinite(maximum) && maximum >= 1) {
+									this.host.settings.maxEntriesPerScan = maximum;
+									await this.host.saveSettings();
+								}
+							}),
+					);
+				},
 			},
-		});
-		definitions.push({
-			name: 'Add recording source',
-			desc: 'The path must be absolute and explicitly configured.',
-			render: (setting) => {
-				setting.addButton((button) =>
-					button.setButtonText('Add source').onClick(async () => {
+		];
+	}
+
+	private recordingSourcesList(): SettingDefinitionList {
+		return {
+			type: 'list',
+			emptyState: 'No recording sources configured yet.',
+			addItem: {
+				name: 'Add recording source',
+				action: () => {
+					void (async () => {
 						this.host.settings.recordingSources.push({
 							id: createId('source'),
 							name: 'DJI microphone',
@@ -531,44 +584,38 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 						});
 						await this.host.saveSettings();
 						this.update();
-					}),
-				);
-			},
-		});
-		return definitions;
-	}
-
-	private sourceDefinition(source: RecordingSource): SettingGroupItem[] {
-		return [
-			{
-				name: source.name,
-				desc: source.path === '' ? 'Path not configured.' : source.path,
-				render: (setting) => {
-					setting
-						.addText((text) =>
-							text
-								.setPlaceholder('Source name')
-								.setValue(source.name)
-								.onChange(async (value) => {
-									source.name = value.trim();
-									await this.host.saveSettings();
-								}),
-						)
-						.addExtraButton((button) =>
-							button
-								.setIcon('trash')
-								.setTooltip('Remove source')
-								.onClick(async () => {
-									this.host.settings.recordingSources =
-										this.host.settings.recordingSources.filter(
-											(candidate) => candidate.id !== source.id,
-										);
-									await this.host.saveSettings();
-									this.update();
-								}),
-						);
+					})();
 				},
 			},
+			onDelete: (index) => {
+				void (async () => {
+					this.host.settings.recordingSources.splice(index, 1);
+					await this.host.saveSettings();
+					this.update();
+				})();
+			},
+			items: this.host.settings.recordingSources.map((source) =>
+				this.sourcePageDefinition(source),
+			),
+		};
+	}
+
+	private sourcePageDefinition(source: RecordingSource): SettingDefinitionPage {
+		return {
+			type: 'page',
+			name: source.name === '' ? 'Unnamed source' : source.name,
+			desc: source.path === '' ? 'Path not configured.' : source.path,
+			status: source.path === '' ? 'warning' : null,
+			items: this.sourceFieldDefinitions(source),
+		};
+	}
+
+	private sourceFieldDefinitions(source: RecordingSource): SettingGroupItem[] {
+		return [
+			this.textFieldDefinition('Source name', source.name, async (value) => {
+				source.name = value;
+				await this.host.saveSettings();
+			}),
 			{
 				name: 'Source path',
 				render: (setting) => {
@@ -738,6 +785,20 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 				},
 			},
 			{
+				name: 'Hide source markers property',
+				desc: `Hides the ${VOICE_JOURNAL_SOURCES_PROPERTY} property (long recording hashes) in the Properties panel. Only affects display; the frontmatter is unchanged and still visible in Source mode.`,
+				render: (setting) => {
+					setting.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.hideSourcesProperty)
+							.onChange(async (value) => {
+								this.host.settings.hideSourcesProperty = value;
+								await this.host.saveSettings();
+							}),
+					);
+				},
+			},
+			{
 				name: 'Add new entries',
 				desc: 'Allow the agent to create missing linked notes outside the journal, following the vault’s existing conventions.',
 				render: (setting) => {
@@ -790,7 +851,7 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 			},
 			{
 				name: 'Artifact cache maximum size',
-				desc: 'Maximum retained audio and transcript cache size in MiB. Oldest recording artifacts are removed first; files in the current run are protected.',
+				desc: 'Maximum retained transcript cache size in MiB. Audio copies are deleted as soon as a recording is transcribed. Oldest recording artifacts are removed first; files in the current run are protected.',
 				render: (setting) => {
 					setting.addText((text) => {
 						text.inputEl.type = 'number';

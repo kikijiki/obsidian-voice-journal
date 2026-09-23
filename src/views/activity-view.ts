@@ -740,12 +740,7 @@ export class VoiceJournalActivityView extends ItemView {
 				});
 			}
 			details.hidden = !this.expandedDetails.has(detailId);
-			this.makeExpandable(
-				summary,
-				detailId,
-				details,
-				`Toggle diff for ${change.path}`,
-			);
+			this.makeExpandable(summary, detailId, details);
 		}
 	}
 
@@ -799,14 +794,7 @@ export class VoiceJournalActivityView extends ItemView {
 				text: event.detail,
 			});
 			detailsContent.hidden = !this.expandedDetails.has(event.id);
-			this.makeExpandable(
-				parent,
-				event.id,
-				detailsContent,
-				event.kind === 'transcript'
-					? 'Toggle full transcript'
-					: 'Toggle event details',
-			);
+			this.makeExpandable(parent, event.id, detailsContent);
 		}
 	}
 
@@ -920,12 +908,7 @@ export class VoiceJournalActivityView extends ItemView {
 				text: event.detail,
 			});
 			detailsContent.hidden = !this.expandedDetails.has(event.id);
-			this.makeExpandable(
-				parent,
-				event.id,
-				detailsContent,
-				'Toggle agent details',
-			);
+			this.makeExpandable(parent, event.id, detailsContent);
 		}
 	}
 
@@ -958,12 +941,10 @@ export class VoiceJournalActivityView extends ItemView {
 		target: HTMLElement,
 		eventId: string,
 		details: HTMLElement,
-		label: string,
 	): void {
 		target.addClass('is-expandable');
 		target.tabIndex = 0;
 		target.setAttribute('role', 'button');
-		target.setAttribute('aria-label', label);
 		target.setAttribute(
 			'aria-expanded',
 			this.expandedDetails.has(eventId) ? 'true' : 'false',

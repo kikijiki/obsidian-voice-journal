@@ -14,7 +14,6 @@ import type { CodingAgentType } from '../src/model';
 const baseSettings = {
 	codingAgentType: 'pi' as CodingAgentType,
 	codingAgentExecutable: 'pi',
-	codingAgentProfile: '',
 	codingAgentModel: 'provider/model',
 	codingAgentThinkingEnabled: false,
 };
@@ -59,18 +58,17 @@ describe('buildAgentInvocation', () => {
 	});
 
 	it.each([
-		['claude', 'claude', '--print', '--agent'],
-		['codex', 'codex', 'exec', '--profile'],
-		['cursor', 'cursor-agent', '--print', null],
+		['claude', 'claude', '--print'],
+		['codex', 'codex', 'exec'],
+		['cursor', 'cursor-agent', '--print'],
 	] as const)(
 		'builds an unattended %s invocation in the vault',
-		(type, executable, firstArgument, profileFlag) => {
+		(type, executable, firstArgument) => {
 			const invocation = buildAgentInvocation(
 				{
 					...baseSettings,
 					codingAgentType: type,
 					codingAgentExecutable: executable,
-					codingAgentProfile: profileFlag === null ? '' : 'journal',
 				},
 				'/vault',
 				'Process this transcript.',
@@ -81,12 +79,8 @@ describe('buildAgentInvocation', () => {
 			expect(invocation.args[0]).toBe(firstArgument);
 			expect(invocation.args).toContain('--model');
 			expect(invocation.args.at(-1)).toBe('Process this transcript.');
-			if (profileFlag === null) {
-				expect(invocation.args).not.toContain('--agent');
-				expect(invocation.args).not.toContain('--profile');
-			} else {
-				expect(invocation.args).toContain(profileFlag);
-			}
+			expect(invocation.args).not.toContain('--agent');
+			expect(invocation.args).not.toContain('--profile');
 		},
 	);
 });

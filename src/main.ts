@@ -37,6 +37,8 @@ interface AppWithSettings {
 	};
 }
 
+const HIDE_SOURCES_PROPERTY_CLASS = 'voice-journal-hide-sources-property';
+
 export default class VoiceJournalPlugin extends Plugin {
 	settings!: VoiceJournalSettings;
 	private runtime!: RuntimeState;
@@ -47,11 +49,29 @@ export default class VoiceJournalPlugin extends Plugin {
 	private progressNotice: Notice | null = null;
 	private currentProgress: PipelineProgress | null = null;
 	private readonly activity = new ActivityLog();
+	private readonly styledWindows = new Set<Window>();
 
 	async onload(): Promise<void> {
 		this.data = parsePluginData(await this.loadData());
 		this.settings = this.data.settings;
 		this.runtime = this.data.runtime;
+		this.trackWindowForStyling(window);
+		this.registerEvent(
+			this.app.workspace.on('window-open', (_workspaceWindow, popout) => {
+				this.trackWindowForStyling(popout);
+			}),
+		);
+		this.registerEvent(
+			this.app.workspace.on('window-close', (_workspaceWindow, popout) => {
+				this.styledWindows.delete(popout);
+			}),
+		);
+		this.register(() => {
+			for (const target of this.styledWindows) {
+				target.document.body.classList.remove(HIDE_SOURCES_PROPERTY_CLASS);
+			}
+			this.styledWindows.clear();
+		});
 		await initializeArtifactStorage(this.getArtifactRoot());
 		const agent = new CodingAgentClient();
 		agent.setRunTimeoutMs(this.settings.codingAgentTimeoutSeconds * 1000);
@@ -135,6 +155,21 @@ export default class VoiceJournalPlugin extends Plugin {
 		this.data.settings = this.settings;
 		await this.saveData(this.data);
 		this.agent?.setRunTimeoutMs(this.settings.codingAgentTimeoutSeconds * 1000);
+		this.applySourcesPropertyVisibility();
+	}
+
+	private trackWindowForStyling(target: Window): void {
+		this.styledWindows.add(target);
+		this.applySourcesPropertyVisibility();
+	}
+
+	private applySourcesPropertyVisibility(): void {
+		for (const target of this.styledWindows) {
+			target.document.body.classList.toggle(
+				HIDE_SOURCES_PROPERTY_CLASS,
+				this.settings.hideSourcesProperty,
+			);
+		}
 	}
 
 	private openPluginSettings(): void {
@@ -178,6 +213,13 @@ export default class VoiceJournalPlugin extends Plugin {
 			throw new Error('Wait for the active voice journal run to finish.');
 		}
 		return await this.coordinator.listCodingAgentModels();
+	}
+
+	async listSttModels(): Promise<string[]> {
+		if (this.coordinator.isRunning()) {
+			throw new Error('Wait for the active voice journal run to finish.');
+		}
+		return await this.coordinator.listSttModels();
 	}
 
 	private scheduleStartupRun(): void {

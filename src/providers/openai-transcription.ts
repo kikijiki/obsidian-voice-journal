@@ -6,6 +6,8 @@ export type TranscriptionRequestUrl = (
 	request: RequestUrlParam,
 ) => Promise<RequestUrlResponse>;
 
+export type TranscriptionRequestFormat = 'multipart' | 'json-base64';
+
 export interface TranscriptionInput {
 	audio: ArrayBuffer;
 	fileName: string;
@@ -15,6 +17,7 @@ export interface TranscriptionInput {
 	language?: string;
 	prompt?: string;
 	timestampGranularities?: Array<'word' | 'segment'>;
+	requestFormat?: TranscriptionRequestFormat;
 }
 
 export interface TranscriptSegment {
@@ -37,8 +40,17 @@ interface MultipartBody {
 	body: ArrayBuffer;
 }
 
+interface JsonBody {
+	contentType: string;
+	body: string;
+}
+
 function safeFileName(fileName: string): string {
 	return fileName.replace(/["\r\n]/g, '_');
+}
+
+function audioFormatFromFileName(fileName: string): string {
+	return /\.([a-z0-9]+)$/iu.exec(fileName)?.[1]?.toLowerCase() ?? 'wav';
 }
 
 function encode(value: string): Uint8Array {
@@ -97,14 +109,48 @@ export function buildTranscriptionMultipart(
 	};
 }
 
-function transcriptionError(response: RequestUrlResponse): string {
-	if (isRecord(response.json)) {
-		const error = response.json.error;
-		if (isRecord(error) && typeof error.message === 'string') {
-			return error.message;
-		}
+export function buildTranscriptionJsonBody(input: TranscriptionInput): JsonBody {
+	const payload: Record<string, unknown> = {
+		input_audio: {
+			data: Buffer.from(input.audio).toString('base64'),
+			format: audioFormatFromFileName(input.fileName),
+		},
+		response_format: 'json',
+	};
+	if (input.model !== '') {
+		payload.model = input.model;
 	}
-	return `HTTP ${response.status.toString()}`;
+	if (input.language !== undefined && input.language !== '') {
+		payload.language = input.language;
+	}
+	if (input.prompt !== undefined && input.prompt !== '') {
+		payload.prompt = input.prompt;
+	}
+	if (input.timestampGranularities !== undefined && input.timestampGranularities.length > 0) {
+		payload.timestamp_granularities = input.timestampGranularities;
+	}
+	return {
+		contentType: 'application/json',
+		body: JSON.stringify(payload),
+	};
+}
+
+function transcriptionError(response: RequestUrlResponse): string {
+	try {
+		const body = response.json as unknown;
+		if (isRecord(body)) {
+			const error = body.error;
+			if (isRecord(error) && typeof error.message === 'string') {
+				return error.message;
+			}
+		}
+	} catch {
+		// Non-JSON error pages (for example a gateway 502) fall through below.
+	}
+	const detail = response.text.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ').trim();
+	return detail === ''
+		? `HTTP ${response.status.toString()}`
+		: `HTTP ${response.status.toString()} (${snippet(detail)})`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -115,9 +161,15 @@ function optionalNumber(value: unknown): number | undefined {
 	return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+function snippet(value: string): string {
+	return value.length > 300 ? `${value.slice(0, 300)}…` : value;
+}
+
 function parseTranscriptionResponse(value: unknown): TranscriptionResult {
 	if (!isRecord(value) || typeof value.text !== 'string') {
-		throw new Error('The transcription provider returned malformed JSON.');
+		throw new Error(
+			`The transcription provider returned malformed JSON without a text field: ${snippet(JSON.stringify(value) ?? String(value))}`,
+		);
 	}
 	const rawSegments = Array.isArray(value.segments) ? value.segments : [];
 	const segments = rawSegments.flatMap((segment, index): TranscriptSegment[] => {
@@ -152,14 +204,17 @@ export class OpenAiTranscriptionProvider {
 		baseUrl: string,
 		input: TranscriptionInput,
 	): Promise<TranscriptionResult> {
-		const multipart = buildTranscriptionMultipart(input);
+		const request =
+			input.requestFormat === 'json-base64'
+				? buildTranscriptionJsonBody(input)
+				: buildTranscriptionMultipart(input);
 		const headers = buildAuthHeaders(input.apiKey ?? '');
 		const response = await withTimeout(
 			this.requester({
 				url: `${normalizeApiBaseUrl(baseUrl)}/audio/transcriptions`,
 				method: 'POST',
-				contentType: multipart.contentType,
-				body: multipart.body,
+				contentType: request.contentType,
+				body: request.body,
 				throw: false,
 				...(headers === undefined ? {} : { headers }),
 			}),
@@ -169,6 +224,14 @@ export class OpenAiTranscriptionProvider {
 		if (response.status < 200 || response.status >= 300) {
 			throw new Error(`Transcription failed: ${transcriptionError(response)}.`);
 		}
-		return parseTranscriptionResponse(response.json as unknown);
+		let parsed: unknown;
+		try {
+			parsed = response.json as unknown;
+		} catch {
+			throw new Error(
+				`The transcription provider returned malformed JSON (HTTP ${response.status.toString()}): ${snippet(response.text)}`,
+			);
+		}
+		return parseTranscriptionResponse(parsed);
 	}
 }

@@ -1,7 +1,6 @@
 import type {
 	AudioCandidate,
 	CodingAgentHealth,
-	ConnectionProfile,
 	PipelineMode,
 	PipelineProgress,
 	PipelineRunResult,
@@ -17,7 +16,7 @@ import type {
 	ScanResult,
 } from '../model';
 import type { NewActivityEvent } from '../activity/log';
-import { getActiveProfile } from '../settings/model';
+import { OPENROUTER_STT_MODEL_QUERY } from '../providers/openrouter';
 import { formatLocalTimestamp } from '../ingest/recording-timestamp';
 import type {
 	ProcessRecordingInput,
@@ -33,6 +32,11 @@ interface Scanner {
 
 interface HealthProvider {
 	checkHealth(baseUrl: string, apiKey?: string): Promise<ProviderHealth>;
+	listModels(
+		baseUrl: string,
+		apiKey?: string,
+		query?: Record<string, string>,
+	): Promise<string[]>;
 }
 
 interface AgentHealthProvider {
@@ -64,14 +68,6 @@ export interface PipelineDependencies {
 	provider: HealthProvider;
 	agent: AgentHealthProvider;
 	processor: Processor;
-}
-
-function requireActiveProfile(settings: VoiceJournalSettings): ConnectionProfile {
-	const profile = getActiveProfile(settings);
-	if (profile === null) {
-		throw new Error('No active speech-to-text connection profile is configured.');
-	}
-	return profile;
 }
 
 function errorMessage(error: unknown): string {
@@ -142,10 +138,18 @@ export class PipelineCoordinator {
 
 	async checkStt(): Promise<ProviderHealth> {
 		const settings = this.dependencies.getSettings();
-		const profile = requireActiveProfile(settings);
 		return await this.dependencies.provider.checkHealth(
-			profile.sttBaseUrl,
-			profile.sttApiKey,
+			settings.sttBaseUrl,
+			settings.sttApiKey,
+		);
+	}
+
+	async listSttModels(): Promise<string[]> {
+		const settings = this.dependencies.getSettings();
+		return await this.dependencies.provider.listModels(
+			settings.sttBaseUrl,
+			settings.sttApiKey,
+			settings.sttProvider === 'openrouter' ? OPENROUTER_STT_MODEL_QUERY : undefined,
 		);
 	}
 
@@ -319,11 +323,16 @@ export class PipelineCoordinator {
 				}
 			}
 
-			const profile = requireActiveProfile(settings);
 			const groups = groupRecordingCandidates(
 				scan.candidates,
 				settings.recordingGrouping,
 			);
+			const statesByFileName = new Map<string, RecordingState[]>();
+			for (const state of Object.values(runtime.recordings)) {
+				const bucket = statesByFileName.get(state.fileName) ?? [];
+				bucket.push(state);
+				statesByFileName.set(state.fileName, bucket);
+			}
 			let candidateIndex = 0;
 			for (const group of groups) {
 				if (this.cancelRequested) {
@@ -343,11 +352,33 @@ export class PipelineCoordinator {
 					return {
 						candidate,
 						settings,
-						sttBaseUrl: profile.sttBaseUrl,
-						sttApiKey: profile.sttApiKey,
+						sttBaseUrl: settings.sttBaseUrl,
+						sttApiKey: settings.sttApiKey,
+						sttRequestFormat:
+							settings.sttProvider === 'openrouter'
+								? ('json-base64' as const)
+								: undefined,
+						splitLongRecordings: settings.sttSplitLongRecordings,
+						ffmpegExecutable: settings.ffmpegExecutable,
 						vaultRoot: this.dependencies.getVaultRoot(),
 						artifactRoot: this.dependencies.getArtifactRoot(),
 						findState: (hash: string) => runtime.recordings[hash],
+						findStateByFingerprint: (target: AudioCandidate) =>
+							statesByFileName
+								.get(target.fileName)
+								?.find(
+									(state) =>
+										state.size === target.size &&
+										state.sourceModifiedAtMs === target.modifiedAtMs,
+								),
+						// Mutates the live state so the fingerprint is persisted by the
+						// end-of-run save instead of writing once per skipped recording.
+						recordFingerprint: (state: RecordingState, target: AudioCandidate) => {
+							state.size = target.size;
+							state.sourceModifiedAtMs = target.modifiedAtMs;
+							state.sourcePath = target.absolutePath;
+							state.fileName = target.fileName;
+						},
 						saveState: async (state: RecordingState) => {
 							runtime.recordings[state.hash] = state;
 							await this.dependencies.saveRuntime(runtime);

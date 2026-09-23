@@ -170,7 +170,6 @@ export function buildAgentInvocation(
 		VoiceJournalSettings,
 		| 'codingAgentType'
 		| 'codingAgentExecutable'
-		| 'codingAgentProfile'
 		| 'codingAgentModel'
 		| 'codingAgentThinkingEnabled'
 	>,
@@ -181,7 +180,6 @@ export function buildAgentInvocation(
 		settings.codingAgentModel === ''
 			? []
 			: ['--model', settings.codingAgentModel];
-	const profile = settings.codingAgentProfile;
 	let args: string[];
 
 	switch (settings.codingAgentType) {
@@ -214,7 +212,6 @@ export function buildAgentInvocation(
 				'--no-session-persistence',
 				'--permission-mode',
 				'bypassPermissions',
-				...(profile === '' ? [] : ['--agent', profile]),
 				...modelArgs,
 				prompt,
 			];
@@ -227,7 +224,6 @@ export function buildAgentInvocation(
 				vaultPath,
 				'--skip-git-repo-check',
 				'--dangerously-bypass-approvals-and-sandbox',
-				...(profile === '' ? [] : ['--profile', profile]),
 				...modelArgs,
 				prompt,
 			];
@@ -347,8 +343,7 @@ export class CodingAgentClient {
 			VoiceJournalSettings,
 			| 'codingAgentType'
 			| 'codingAgentExecutable'
-			| 'codingAgentProfile'
-			| 'codingAgentModel'
+				| 'codingAgentModel'
 			| 'codingAgentThinkingEnabled'
 		>,
 		vaultPath: string,

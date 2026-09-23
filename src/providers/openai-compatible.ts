@@ -44,6 +44,15 @@ export function buildAuthHeaders(apiKey: string): Record<string, string> | undef
 	return trimmed === '' ? undefined : { Authorization: `Bearer ${trimmed}` };
 }
 
+function modelsUrl(
+	normalizedBaseUrl: string,
+	query?: Record<string, string>,
+): string {
+	const search =
+		query === undefined ? '' : `?${new URLSearchParams(query).toString()}`;
+	return `${normalizedBaseUrl}/models${search}`;
+}
+
 export class OpenAiCompatibleProvider {
 	constructor(
 		private readonly requester: RequestUrlLike,
@@ -58,7 +67,7 @@ export class OpenAiCompatibleProvider {
 			const headers = buildAuthHeaders(apiKey);
 			const response = await withTimeout(
 				this.requester({
-					url: `${normalizedUrl}/models`,
+					url: modelsUrl(normalizedUrl),
 					method: 'GET',
 					throw: false,
 					...(headers === undefined ? {} : { headers }),
@@ -90,5 +99,28 @@ export class OpenAiCompatibleProvider {
 				error: error instanceof Error ? error.message : 'Unknown provider error.',
 			};
 		}
+	}
+
+	async listModels(
+		baseUrl: string,
+		apiKey = '',
+		query?: Record<string, string>,
+	): Promise<string[]> {
+		const normalizedUrl = normalizeApiBaseUrl(baseUrl);
+		const headers = buildAuthHeaders(apiKey);
+		const response = await withTimeout(
+			this.requester({
+				url: modelsUrl(normalizedUrl, query),
+				method: 'GET',
+				throw: false,
+				...(headers === undefined ? {} : { headers }),
+			}),
+			this.timeoutMs,
+			'Model discovery',
+		);
+		if (response.status < 200 || response.status >= 300) {
+			throw new Error(`Model discovery failed: HTTP ${response.status.toString()} from /models.`);
+		}
+		return parseModelIds(response.json);
 	}
 }

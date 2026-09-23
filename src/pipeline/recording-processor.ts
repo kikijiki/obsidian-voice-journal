@@ -7,6 +7,7 @@ import {
 	readFile,
 	readdir,
 	rename,
+	rm,
 	stat,
 	unlink,
 	writeFile,
@@ -35,7 +36,9 @@ import { formatLocalTimestamp } from '../ingest/recording-timestamp';
 import type { NewActivityEvent } from '../activity/log';
 import type {
 	TranscriptionInput,
+	TranscriptionRequestFormat,
 	TranscriptionResult,
+	TranscriptSegment,
 } from '../providers/openai-transcription';
 import {
 	codingAgentName,
@@ -46,6 +49,12 @@ import {
 	snapshotVaultNotes,
 } from '../changes/vault-changes';
 import { pruneArtifactCache } from '../storage/artifact-cache';
+import {
+	FfmpegAudioSplitter,
+	isMissingExecutable,
+	type AudioSplitter,
+} from '../audio/ffmpeg';
+import { planChunkSeconds, STT_MAX_CHUNK_BYTES } from '../audio/chunking';
 
 interface TranscriptionProvider {
 	transcribe(
@@ -72,9 +81,14 @@ export interface ProcessRecordingInput {
 	settings: VoiceJournalSettings;
 	sttBaseUrl: string;
 	sttApiKey?: string;
+	sttRequestFormat?: TranscriptionRequestFormat;
+	splitLongRecordings?: boolean;
+	ffmpegExecutable?: string;
 	vaultRoot: string;
 	artifactRoot: string;
 	findState: (hash: string) => RecordingState | undefined;
+	findStateByFingerprint?: (candidate: AudioCandidate) => RecordingState | undefined;
+	recordFingerprint?: (state: RecordingState, candidate: AudioCandidate) => void;
 	saveState: SaveRecordingState;
 	reportProgress: ReportProgress;
 	reportActivity?: (event: NewActivityEvent) => void;
@@ -98,6 +112,10 @@ interface PreparedRecording {
 }
 
 const SOURCE_MARKER_PATTERN = /sha256:[a-f0-9]{64}/gu;
+
+// Kept in sync by hand with the `.metadata-property[data-property-key="..."]`
+// selector in styles.css that hides this property in the Properties panel.
+export const VOICE_JOURNAL_SOURCES_PROPERTY = 'voice_journal_sources';
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown processing error.';
@@ -152,6 +170,42 @@ function audioContentType(path: string): string {
 		default:
 			return 'application/octet-stream';
 	}
+}
+
+function combineTranscriptionResults(
+	results: TranscriptionResult[],
+): TranscriptionResult {
+	if (results.length === 1 && results[0] !== undefined) {
+		return results[0];
+	}
+	let offsetSeconds = 0;
+	let segmentIndex = 0;
+	const segments: TranscriptSegment[] = [];
+	for (const result of results) {
+		for (const segment of result.segments) {
+			segmentIndex += 1;
+			segments.push({
+				id: `seg-${segmentIndex.toString().padStart(4, '0')}`,
+				start:
+					segment.start === undefined ? undefined : segment.start + offsetSeconds,
+				end: segment.end === undefined ? undefined : segment.end + offsetSeconds,
+				text: segment.text,
+			});
+		}
+		if (result.duration !== undefined) {
+			offsetSeconds += result.duration;
+		}
+	}
+	return {
+		text: results
+			.map((result) => result.text.trim())
+			.filter((text) => text !== '')
+			.join('\n\n'),
+		language: results.find((result) => result.language !== undefined)?.language,
+		duration: offsetSeconds > 0 ? offsetSeconds : undefined,
+		segments,
+		rawResponse: results.map((result) => result.rawResponse),
+	};
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
@@ -214,6 +268,28 @@ function restoreArtifactPath(
 	return restored;
 }
 
+// The archived copy only exists so an interrupted run can transcribe without
+// the original (which may be on removable media). Once the transcript is
+// stored nothing needs it, so it is deleted rather than left to the cache cap.
+async function discardArchivedAudio(
+	input: ProcessRecordingInput,
+	state: RecordingState,
+): Promise<void> {
+	if (state.archivedAudioPath === undefined) {
+		return;
+	}
+	const path = restoreArtifactPath(
+		input.vaultRoot,
+		resolve(input.artifactRoot),
+		state.archivedAudioPath,
+		'',
+	);
+	if (path !== '') {
+		await unlink(path).catch(() => undefined);
+	}
+	state.archivedAudioPath = undefined;
+}
+
 async function verifiedCopy(source: string, destination: string): Promise<void> {
 	try {
 		const existingHash = await hashFile(destination);
@@ -249,7 +325,7 @@ function extractSourceMarkers(contents: string): string[] {
 	}
 	const lines = frontmatter.split(/\r?\n/u);
 	const propertyIndex = lines.findIndex((line) =>
-		/^voice_journal_sources\s*:/u.test(line),
+		new RegExp(`^${VOICE_JOURNAL_SOURCES_PROPERTY}\\s*:`, 'u').test(line),
 	);
 	if (propertyIndex < 0) {
 		return [];
@@ -318,7 +394,6 @@ export function buildJournalAgentPrompt(input: {
 		fileName: string;
 		sourceHash: string;
 		recordedAt: string;
-		archivedAudioPath: string;
 		transcriptPath: string;
 	}>;
 }): string {
@@ -334,7 +409,6 @@ export function buildJournalAgentPrompt(input: {
 		.map(
 			(recording, index) => `### Recording ${(index + 1).toString()}
 - Raw transcript: ${JSON.stringify(recording.transcriptPath)}
-- Retained audio: ${JSON.stringify(recording.archivedAudioPath)}
 - Original filename: ${JSON.stringify(recording.fileName)}
 - SHA-256: ${recording.sourceHash}
 - Recording time: ${recording.recordedAt}
@@ -376,7 +450,7 @@ Constraints:
 - Never search inside .voice-journal, hidden folders, run logs, audio, transcripts, notebooks, or other non-Markdown files beyond those exact transcript reads. Do not feed operational logs back into the agent context.
 - Search for an idempotency marker only inside ${JSON.stringify(input.journalDirectory)}, with glob "**/*.md", literal true, and a small result limit.
 - Every journal entry you create or modify for these recordings must have valid YAML frontmatter at the very beginning of the file. Preserve and merge existing frontmatter. For a newly created daily note, add a date property whose value is YYYY-MM-DD.
-- Store provenance in a voice_journal_sources YAML list. Add each exact quoted frontmatter source value listed above. Never write voice-journal provenance as an HTML comment or visible body text.
+- Store provenance in a ${VOICE_JOURNAL_SOURCES_PROPERTY} YAML list. Add each exact quoted frontmatter source value listed above. Never write voice-journal provenance as an HTML comment or visible body text.
 - Obsidian displays the filename as the inline title. When a daily note filename is YYYY-MM-DD.md, do not add an H1 containing the same date. Begin with prose or a meaningful H2 section instead.
 - If a tool fails, inspect its error and choose a corrected or simpler action. Never repeat an identical failed call. In particular, an EISDIR error means you must select a file inside that directory before calling read again.
 - Preserve unrelated manual content.
@@ -385,7 +459,7 @@ Constraints:
 - Do not modify anything under .voice-journal.
 - Do not create review queues, provenance directories, or a new vault taxonomy.
 - Make the smallest coherent set of edits.
-- For every recording, search for its exact frontmatter source value before writing. Do not duplicate contributions whose source value already exists. Merge each missing value into the target journal entry's voice_journal_sources list.
+- For every recording, search for its exact frontmatter source value before writing. Do not duplicate contributions whose source value already exists. Merge each missing value into the target journal entry's ${VOICE_JOURNAL_SOURCES_PROPERTY} list.
 
 ${additionalInstructions === '' ? '' : `Trusted user-supplied vault instructions:\n${additionalInstructions}\n`}
 
@@ -397,6 +471,7 @@ export class RecordingProcessor {
 		private readonly transcriber: TranscriptionProvider,
 		private readonly agent: AgentRunner,
 		private readonly stabilityDelayMs = 1_500,
+		private readonly audioSplitter: AudioSplitter = new FfmpegAudioSplitter(),
 	) {}
 
 	cancel(): boolean {
@@ -492,22 +567,39 @@ export class RecordingProcessor {
 	): Promise<PreparedRecording | 'skipped'> {
 		const { candidate, reportProgress } = input;
 		assertNotCancelled(input);
-		reportProgress({
-			stage: 'stabilizing',
-			message: `Checking that ${candidate.fileName} is stable…`,
-			fileName: candidate.fileName,
-		});
-		await assertStable(candidate, this.stabilityDelayMs);
-		assertNotCancelled(input);
+		// A file whose name, size, and modification time match a previously
+		// recorded state was already verified stable and hashed, so both the
+		// stability wait and the full read can be skipped.
+		const fingerprintMatch = input.findStateByFingerprint?.(candidate);
+		let hash: string;
+		if (fingerprintMatch === undefined) {
+			reportProgress({
+				stage: 'stabilizing',
+				message: `Checking that ${candidate.fileName} is stable…`,
+				fileName: candidate.fileName,
+			});
+			await assertStable(candidate, this.stabilityDelayMs);
+			assertNotCancelled(input);
 
-		reportProgress({
-			stage: 'hashing',
-			message: `Hashing ${candidate.fileName}…`,
-			fileName: candidate.fileName,
-		});
-		const hash = await hashFile(candidate.absolutePath);
-		assertNotCancelled(input);
+			reportProgress({
+				stage: 'hashing',
+				message: `Hashing ${candidate.fileName}…`,
+				fileName: candidate.fileName,
+			});
+			hash = await hashFile(candidate.absolutePath);
+			assertNotCancelled(input);
+		} else {
+			hash = fingerprintMatch.hash;
+		}
 		const existingState = input.findState(hash);
+		const marker = `sha256:${hash}`;
+		if (existingState?.stage === 'complete' && knownMarkers.has(marker)) {
+			if (fingerprintMatch === undefined) {
+				input.recordFingerprint?.(existingState, candidate);
+			}
+			await discardArchivedAudio(input, existingState);
+			return 'skipped';
+		}
 		const artifactRoot = resolve(input.artifactRoot);
 		const recordingRoot = join(artifactRoot, hash.slice(0, 2), hash);
 		await mkdir(recordingRoot, { recursive: true, mode: 0o700 });
@@ -542,6 +634,8 @@ export class RecordingProcessor {
 			hash,
 			sourcePath: candidate.absolutePath,
 			fileName: candidate.fileName,
+			size: candidate.size,
+			sourceModifiedAtMs: candidate.modifiedAtMs,
 			attempts: state.attempts + 1,
 			updatedAt: new Date().toISOString(),
 			lastError: undefined,
@@ -550,7 +644,6 @@ export class RecordingProcessor {
 			input.vaultRoot,
 			input.settings.journalDirectory,
 		);
-		const marker = `sha256:${hash}`;
 		const archivedAudioExists = await fileExists(archivedAudio);
 		const transcriptExists = await fileExists(transcriptPath);
 		const rawResponseExists = await fileExists(rawResponsePath);
@@ -558,7 +651,7 @@ export class RecordingProcessor {
 			...state,
 			archivedAudioPath: archivedAudioExists
 				? vaultRelative(input.vaultRoot, archivedAudio)
-				: state.archivedAudioPath,
+				: undefined,
 			transcriptPath: transcriptExists
 				? vaultRelative(input.vaultRoot, transcriptPath)
 				: state.transcriptPath,
@@ -566,21 +659,18 @@ export class RecordingProcessor {
 				? vaultRelative(input.vaultRoot, rawResponsePath)
 				: state.rawResponsePath,
 		};
-		if (
-			state.stage === 'complete' &&
-			knownMarkers.has(marker)
-		) {
-			return 'skipped';
-		}
-		if (state.stage !== 'discovered' && !archivedAudioExists) {
+		if (state.stage === 'copied' && !archivedAudioExists) {
 			state = { ...state, stage: 'discovered' };
 		} else if (
 			(state.stage === 'transcribed' || state.stage === 'complete') &&
 			(!transcriptExists || !rawResponseExists)
 		) {
-			state = { ...state, stage: 'copied' };
+			state = { ...state, stage: archivedAudioExists ? 'copied' : 'discovered' };
 		} else if (state.stage === 'complete') {
 			state = { ...state, stage: 'transcribed' };
+		}
+		if (state.stage === 'transcribed') {
+			await discardArchivedAudio(input, state);
 		}
 		await input.saveState(state);
 
@@ -608,18 +698,10 @@ export class RecordingProcessor {
 					message: `Transcribing ${candidate.fileName}…`,
 					fileName: candidate.fileName,
 				});
-				const audio = await readFile(archivedAudio);
-				const audioBuffer = audio.buffer.slice(
-					audio.byteOffset,
-					audio.byteOffset + audio.byteLength,
+				const transcript = await this.transcribeArchivedAudio(
+					input,
+					archivedAudio,
 				);
-				const transcript = await this.transcriber.transcribe(input.sttBaseUrl, {
-					audio: audioBuffer,
-					fileName: candidate.fileName,
-					contentType: audioContentType(candidate.fileName),
-					model: input.settings.sttModel,
-					apiKey: input.sttApiKey ?? '',
-				});
 				if (transcript.text.trim() === '') {
 					throw new Error('Speech-to-text returned an empty transcript.');
 				}
@@ -644,13 +726,13 @@ export class RecordingProcessor {
 					rawResponsePath: vaultRelative(input.vaultRoot, rawResponsePath),
 					updatedAt: new Date().toISOString(),
 				};
+				await discardArchivedAudio(input, state);
 				await input.saveState(state);
 				assertNotCancelled(input);
 			}
 
 			if (
 				state.stage !== 'transcribed' ||
-				state.archivedAudioPath === undefined ||
 				state.transcriptPath === undefined
 			) {
 				throw new Error('Recording preparation did not produce a transcript.');
@@ -664,6 +746,106 @@ export class RecordingProcessor {
 			});
 			throw error;
 		}
+	}
+
+	private async transcribeArchivedAudio(
+		input: ProcessRecordingInput,
+		archivedAudio: string,
+	): Promise<TranscriptionResult> {
+		if (input.splitLongRecordings !== true) {
+			return await this.transcribeFile(
+				input,
+				archivedAudio,
+				input.candidate.fileName,
+			);
+		}
+
+		const ffmpegExecutable =
+			input.ffmpegExecutable === undefined || input.ffmpegExecutable.trim() === ''
+				? 'ffmpeg'
+				: input.ffmpegExecutable;
+		const sizeBytes = input.candidate.size;
+		let durationSeconds: number | null;
+		try {
+			durationSeconds = await this.audioSplitter.probeDurationSeconds(
+				archivedAudio,
+				ffmpegExecutable,
+			);
+		} catch (error) {
+			if (!isMissingExecutable(error)) {
+				throw error;
+			}
+			if (sizeBytes <= STT_MAX_CHUNK_BYTES) {
+				return await this.transcribeFile(
+					input,
+					archivedAudio,
+					input.candidate.fileName,
+				);
+			}
+			throw new Error(
+				`ffmpeg (${ffmpegExecutable}) was not found, but it is required to split this recording. Install ffmpeg or set its path in the speech-to-text settings.`,
+			);
+		}
+		const chunkSeconds = planChunkSeconds(sizeBytes, durationSeconds);
+		if (chunkSeconds === null) {
+			return await this.transcribeFile(
+				input,
+				archivedAudio,
+				input.candidate.fileName,
+			);
+		}
+		const chunkDir = `${archivedAudio}.chunks-${randomUUID()}`;
+		await mkdir(chunkDir, { recursive: true, mode: 0o700 });
+		try {
+			const chunkPaths = await this.audioSplitter.split(
+				archivedAudio,
+				chunkDir,
+				chunkSeconds,
+				ffmpegExecutable,
+			);
+			if (chunkPaths.length === 0) {
+				throw new Error('ffmpeg did not produce any audio segments.');
+			}
+			const results: TranscriptionResult[] = [];
+			for (const [index, chunkPath] of chunkPaths.entries()) {
+				assertNotCancelled(input);
+				const chunkLabel =
+					chunkPaths.length === 1
+						? input.candidate.fileName
+						: `${input.candidate.fileName} (part ${(index + 1).toString()}/${chunkPaths.length.toString()})`;
+				if (chunkPaths.length > 1) {
+					input.reportProgress({
+						stage: 'transcribing',
+						message: `Transcribing ${chunkLabel}…`,
+						fileName: input.candidate.fileName,
+					});
+				}
+				results.push(await this.transcribeFile(input, chunkPath, chunkLabel));
+			}
+			return combineTranscriptionResults(results);
+		} finally {
+			await rm(chunkDir, { recursive: true, force: true }).catch(() => undefined);
+		}
+	}
+
+	private async transcribeFile(
+		input: ProcessRecordingInput,
+		filePath: string,
+		uploadFileName: string,
+	): Promise<TranscriptionResult> {
+		const audio = await readFile(filePath);
+		const audioBuffer = audio.buffer.slice(
+			audio.byteOffset,
+			audio.byteOffset + audio.byteLength,
+		);
+		return await this.transcriber.transcribe(input.sttBaseUrl, {
+			audio: audioBuffer,
+			fileName: uploadFileName,
+			contentType: audioContentType(filePath),
+			model: input.settings.sttModel,
+			apiKey: input.sttApiKey ?? '',
+			requestFormat: input.sttRequestFormat,
+		});
 	}
 
 	private async journal(prepared: PreparedRecording[]): Promise<void> {
@@ -694,7 +876,6 @@ export class RecordingProcessor {
 				recordedAt: formatLocalTimestamp(
 					recording.input.candidate.recordedAtMs,
 				),
-				archivedAudioPath: recording.state.archivedAudioPath ?? '',
 				transcriptPath: recording.state.transcriptPath ?? '',
 			})),
 		});

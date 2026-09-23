@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
 	AudioCandidate,
@@ -259,8 +260,15 @@ describe('RecordingProcessor', () => {
 		expect(await process()).toBe('processed');
 		const state = Object.values(states)[0];
 		expect(state?.stage).toBe('complete');
-		expect(state?.archivedAudioPath).toContain('.voice-journal');
+		expect(state?.archivedAudioPath).toBeUndefined();
 		expect(state?.transcriptPath).toContain('raw-transcript.txt');
+		const recordingFiles = await readdir(
+			dirname(join(input.vaultRoot, state?.transcriptPath ?? '')),
+		);
+		expect(recordingFiles.sort()).toEqual([
+			'raw-transcript.txt',
+			'stt-response.json',
+		]);
 		expect(await readFile(input.candidate.absolutePath, 'utf8')).toBe(
 			'synthetic audio',
 		);
@@ -307,7 +315,6 @@ describe('RecordingProcessor', () => {
 					fileName: 'recording.wav',
 					sourceHash: 'abc123',
 					recordedAt: '2026-09-21T09:00:00.000+09:00',
-					archivedAudioPath: 'Journal/.voice-journal/audio.wav',
 					transcriptPath: 'Journal/.voice-journal/raw-transcript.txt',
 				},
 			],
@@ -408,6 +415,306 @@ describe('RecordingProcessor', () => {
 		expect(transcribe).toHaveBeenCalledOnce();
 		expect(successfulRun).toHaveBeenCalledOnce();
 		expect(Object.values(states)[0]?.stage).toBe('complete');
+	});
+
+	it('splits long recordings with ffmpeg, transcribes each chunk, and stitches the results', async () => {
+		const input = await fixture();
+		const run = vi.fn(
+			async (
+				_settings: VoiceJournalSettings,
+				vaultPath: string,
+				prompt: string,
+			) => {
+				const source = sourceValuesFromPrompt(prompt)[0];
+				await mkdir(join(vaultPath, 'Journal'), { recursive: true });
+				await writeFile(
+					join(vaultPath, 'Journal', 'entry.md'),
+					journalWithSources(source === undefined ? [] : [source]),
+				);
+				return { stdout: 'done', stderr: '' };
+			},
+		);
+		const transcribe = vi.fn(
+			async (_baseUrl: string, request: { fileName: string }) => ({
+				text: request.fileName.includes('part 1')
+					? 'First half.'
+					: 'Second half.',
+				segments: [{ id: 'seg-0001', start: 0, end: 1, text: 'chunk' }],
+				duration: 30,
+				rawResponse: { fileName: request.fileName },
+			}),
+		);
+		const splitCalls: Array<{
+			inputPath: string;
+			outputDir: string;
+			chunkSeconds: number;
+			ffmpegExecutable: string;
+		}> = [];
+		let chunkDir = '';
+		const audioSplitter = {
+			probeDurationSeconds: async () => 600,
+			split: async (
+				inputPath: string,
+				outputDir: string,
+				chunkSeconds: number,
+				ffmpegExecutable: string,
+			) => {
+				splitCalls.push({ inputPath, outputDir, chunkSeconds, ffmpegExecutable });
+				chunkDir = outputDir;
+				const first = join(outputDir, 'chunk-0000.wav');
+				const second = join(outputDir, 'chunk-0001.wav');
+				await writeFile(first, 'chunk one');
+				await writeFile(second, 'chunk two');
+				return [first, second];
+			},
+		};
+		const states: Record<string, RecordingState> = {};
+
+		await expect(
+			new RecordingProcessor(
+				{ transcribe },
+				{ run },
+				0,
+				audioSplitter,
+			).process({
+				...input,
+				sttBaseUrl: 'https://openrouter.ai/api/v1',
+				splitLongRecordings: true,
+				ffmpegExecutable: 'test-ffmpeg',
+				findState: (hash) => states[hash],
+				saveState: async (state) => {
+					states[state.hash] = state;
+				},
+				reportProgress: () => undefined,
+			}),
+		).resolves.toBe('processed');
+
+		expect(transcribe).toHaveBeenCalledTimes(2);
+		expect(splitCalls).toHaveLength(1);
+		expect(splitCalls[0]?.inputPath).toContain(input.candidate.fileName);
+		expect(typeof splitCalls[0]?.outputDir).toBe('string');
+		expect(splitCalls[0]?.chunkSeconds).toBe(300);
+		expect(splitCalls[0]?.ffmpegExecutable).toBe('test-ffmpeg');
+		const state = Object.values(states)[0];
+		const transcriptContents = await readFile(
+			join(input.vaultRoot, state?.transcriptPath ?? ''),
+			'utf8',
+		);
+		expect(transcriptContents.trim()).toBe('First half.\n\nSecond half.');
+		await expect(stat(chunkDir)).rejects.toThrow();
+	});
+
+	it('skips stability and hashing when a recorded fingerprint matches', async () => {
+		const input = await fixture();
+		const fakeHash = 'a'.repeat(64);
+		await mkdir(join(input.vaultRoot, 'Journal'), { recursive: true });
+		await writeFile(
+			join(input.vaultRoot, 'Journal', 'entry.md'),
+			journalWithSources([`"sha256:${fakeHash}"`]),
+		);
+		const knownState: RecordingState = {
+			hash: fakeHash,
+			stage: 'complete',
+			sourcePath: input.candidate.absolutePath,
+			fileName: input.candidate.fileName,
+			size: input.candidate.size,
+			sourceModifiedAtMs: input.candidate.modifiedAtMs,
+			attempts: 1,
+			updatedAt: '2026-09-23T00:00:00.000Z',
+		};
+		const transcribe = vi.fn();
+		const progress: PipelineProgress[] = [];
+
+		const result = await new RecordingProcessor(
+			{ transcribe },
+			{ run: vi.fn() },
+			60_000,
+		).process({
+			...input,
+			sttBaseUrl: 'http://localhost:8001/v1',
+			findState: (hash) => (hash === fakeHash ? knownState : undefined),
+			findStateByFingerprint: () => knownState,
+			saveState: async () => undefined,
+			reportProgress: (next) => progress.push(next),
+		});
+
+		expect(result).toBe('skipped');
+		expect(transcribe).not.toHaveBeenCalled();
+		expect(progress.map((entry) => entry.stage)).not.toContain('hashing');
+		expect(progress.map((entry) => entry.stage)).not.toContain('stabilizing');
+	});
+
+	it('deletes leftover archived audio from an already-complete recording', async () => {
+		const input = await fixture();
+		const realHash = createHash('sha256').update('synthetic audio').digest('hex');
+		await mkdir(join(input.vaultRoot, 'Journal'), { recursive: true });
+		await writeFile(
+			join(input.vaultRoot, 'Journal', 'entry.md'),
+			journalWithSources([`"sha256:${realHash}"`]),
+		);
+		const recordingDir = join(input.artifactRoot, realHash.slice(0, 2), realHash);
+		await mkdir(recordingDir, { recursive: true });
+		const audioPath = join(recordingDir, 'old.wav');
+		await writeFile(audioPath, 'retained audio');
+		const state: RecordingState = {
+			hash: realHash,
+			stage: 'complete',
+			sourcePath: input.candidate.absolutePath,
+			fileName: input.candidate.fileName,
+			archivedAudioPath: relative(input.vaultRoot, audioPath),
+			attempts: 1,
+			updatedAt: '2026-09-23T00:00:00.000Z',
+		};
+
+		const result = await new RecordingProcessor(
+			{ transcribe: vi.fn() },
+			{ run: vi.fn() },
+			0,
+		).process({
+			...input,
+			sttBaseUrl: 'http://localhost:8001/v1',
+			findState: (hash) => (hash === realHash ? state : undefined),
+			saveState: async () => undefined,
+			reportProgress: () => undefined,
+		});
+
+		expect(result).toBe('skipped');
+		expect(state.archivedAudioPath).toBeUndefined();
+		await expect(stat(audioPath)).rejects.toThrow();
+	});
+
+	it('records the fingerprint on an already-complete recording found by hash', async () => {
+		const input = await fixture();
+		const realHash = createHash('sha256').update('synthetic audio').digest('hex');
+		await mkdir(join(input.vaultRoot, 'Journal'), { recursive: true });
+		await writeFile(
+			join(input.vaultRoot, 'Journal', 'entry.md'),
+			journalWithSources([`"sha256:${realHash}"`]),
+		);
+		const legacyState: RecordingState = {
+			hash: realHash,
+			stage: 'complete',
+			sourcePath: '/old/location/recording.wav',
+			fileName: 'recording.wav',
+			attempts: 1,
+			updatedAt: '2026-09-23T00:00:00.000Z',
+		};
+		const recordFingerprint = vi.fn();
+		const saveState = vi.fn(async () => undefined);
+
+		const result = await new RecordingProcessor(
+			{ transcribe: vi.fn() },
+			{ run: vi.fn() },
+			0,
+		).process({
+			...input,
+			sttBaseUrl: 'http://localhost:8001/v1',
+			findState: (hash) => (hash === realHash ? legacyState : undefined),
+			findStateByFingerprint: () => undefined,
+			recordFingerprint,
+			saveState,
+			reportProgress: () => undefined,
+		});
+
+		expect(result).toBe('skipped');
+		expect(recordFingerprint).toHaveBeenCalledWith(legacyState, input.candidate);
+		expect(saveState).not.toHaveBeenCalled();
+	});
+
+	async function processWithSplitter(
+		size: number,
+		audioSplitter: {
+			probeDurationSeconds: () => Promise<number | null>;
+			split: () => Promise<string[]>;
+		},
+	): Promise<{ transcribe: ReturnType<typeof vi.fn>; result: Promise<unknown> }> {
+		const input = await fixture();
+		const transcribe = vi.fn(async () => ({
+			text: 'Whole file transcript.',
+			segments: [],
+			rawResponse: {},
+		}));
+		const states: Record<string, RecordingState> = {};
+		const result = new RecordingProcessor(
+			{ transcribe },
+			{ run: vi.fn(async () => ({ stdout: '', stderr: '' })) },
+			0,
+			audioSplitter,
+		).process({
+			...input,
+			candidate: { ...input.candidate, size },
+			sttBaseUrl: 'http://localhost:8001/v1',
+			splitLongRecordings: true,
+			findState: (hash) => states[hash],
+			saveState: async (state) => {
+				states[state.hash] = state;
+			},
+			reportProgress: () => undefined,
+		});
+		return { transcribe, result };
+	}
+
+	it('sends a recording within the limits whole without splitting', async () => {
+		const split = vi.fn();
+		const { transcribe, result } = await processWithSplitter(1024, {
+			probeDurationSeconds: async () => 60,
+			split,
+		});
+		await result.catch(() => undefined);
+		expect(split).not.toHaveBeenCalled();
+		expect(transcribe).toHaveBeenCalledTimes(1);
+	});
+
+	it('sends a small recording whole when ffmpeg is not installed', async () => {
+		const { transcribe, result } = await processWithSplitter(1024, {
+			probeDurationSeconds: async () => {
+				throw Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' });
+			},
+			split: vi.fn(),
+		});
+		await result.catch(() => undefined);
+		expect(transcribe).toHaveBeenCalledTimes(1);
+	});
+
+	it('explains that ffmpeg is required for an oversized recording when it is missing', async () => {
+		const { transcribe, result } = await processWithSplitter(50 * 1024 * 1024, {
+			probeDurationSeconds: async () => {
+				throw Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' });
+			},
+			split: vi.fn(),
+		});
+		await expect(result).rejects.toThrow(/ffmpeg .*not found/);
+		expect(transcribe).not.toHaveBeenCalled();
+	});
+
+	it('does not probe or split when splitting is switched off', async () => {
+		const input = await fixture();
+		const run = vi.fn(async () => ({ stdout: '', stderr: '' }));
+		const transcribe = vi.fn(async () => ({
+			text: 'Whole file transcript.',
+			segments: [],
+			rawResponse: {},
+		}));
+		const split = vi.fn();
+		const states: Record<string, RecordingState> = {};
+
+		await new RecordingProcessor(
+			{ transcribe },
+			{ run },
+			0,
+			{ split, probeDurationSeconds: vi.fn() },
+		).process({
+			...input,
+			sttBaseUrl: 'http://localhost:8001/v1',
+			findState: (hash) => states[hash],
+			saveState: async (state) => {
+				states[state.hash] = state;
+			},
+			reportProgress: () => undefined,
+		}).catch(() => undefined);
+
+		expect(split).not.toHaveBeenCalled();
+		expect(transcribe).toHaveBeenCalledTimes(1);
 	});
 
 	it('does not mark an exit-zero agent run complete without source metadata', async () => {

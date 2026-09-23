@@ -16,20 +16,28 @@ describe('normalizeVaultRelativePath', () => {
 describe('parsePluginData', () => {
 	it('provides generic provider-neutral defaults', () => {
 		const data = parsePluginData(undefined);
-		expect(data.settings.activeConnectionProfileId).toBe('default');
-		expect(data.settings.connectionProfiles[0]?.sttBaseUrl).toBe('');
+		expect(data.settings.sttProvider).toBe('custom');
+		expect(data.settings.sttBaseUrl).toBe('');
+		expect(data.settings.sttApiKey).toBe('');
+		expect(data.settings.sttSplitLongRecordings).toBe(true);
+		expect(data.settings.ffmpegExecutable).toBe('ffmpeg');
 		expect(data.settings.codingAgentType).toBe('pi');
 		expect(data.settings.codingAgentExecutable).toBe('pi');
 		expect(data.settings.codingAgentThinkingEnabled).toBe(false);
 		expect(data.settings.codingAgentTimeoutSeconds).toBe(0);
-		expect(data.settings.connectionProfiles[0]?.sttApiKey).toBe('');
 		expect(data.settings.startupMode).toBe('off');
 		expect(data.settings.recordingGrouping).toBe('day');
 		expect(data.settings.agentAddNewEntries).toBe(true);
 		expect(data.settings.agentUpdateExistingEntries).toBe(true);
 		expect(data.settings.additionalAgentInstructions).toBe('');
 		expect(data.settings.artifactCacheMaxMb).toBe(5_120);
+		expect(data.settings.hideSourcesProperty).toBe(true);
 		expect(data.settings.schemaVersion).toBe(1);
+	});
+
+	it('preserves an explicit choice to show the sources property', () => {
+		const data = parsePluginData({ settings: { hideSourcesProperty: false } });
+		expect(data.settings.hideSourcesProperty).toBe(false);
 	});
 
 	it('preserves disabled auxiliary-note permissions', () => {
@@ -55,26 +63,75 @@ describe('parsePluginData', () => {
 		expect(data.settings.recordingGrouping).toBe('week');
 	});
 
-	it('preserves an explicit Tailscale profile as active', () => {
+	it('preserves an explicit flat speech-to-text configuration', () => {
+		const data = parsePluginData({
+			settings: {
+				sttProvider: 'openrouter',
+				sttBaseUrl: 'https://openrouter.ai/api/v1',
+				sttApiKey: 'sk-or-secret',
+				sttSplitLongRecordings: false,
+				ffmpegExecutable: '/usr/local/bin/ffmpeg',
+			},
+		});
+		expect(data.settings.sttProvider).toBe('openrouter');
+		expect(data.settings.sttBaseUrl).toBe('https://openrouter.ai/api/v1');
+		expect(data.settings.sttApiKey).toBe('sk-or-secret');
+		expect(data.settings.sttSplitLongRecordings).toBe(false);
+		expect(data.settings.ffmpegExecutable).toBe('/usr/local/bin/ffmpeg');
+	});
+
+	it('falls back to a custom speech-to-text provider for an unrecognized value', () => {
+		const data = parsePluginData({
+			settings: { sttProvider: 'not-a-real-provider' },
+		});
+		expect(data.settings.sttProvider).toBe('custom');
+	});
+
+	it('migrates a legacy multi-profile install by recovering the active profile', () => {
 		const data = parsePluginData({
 			settings: {
 				activeConnectionProfileId: 'tailscale',
 				connectionProfiles: [
 					{
+						id: 'localhost',
+						label: 'Same-host speech-to-text',
+						sttProvider: 'custom',
+						sttBaseUrl: 'http://127.0.0.1:8001/v1',
+						sttApiKey: '',
+						networkScope: 'loopback',
+					},
+					{
 						id: 'tailscale',
-						label: 'Tailscale',
-						sttBaseUrl: 'http://example.ts.net:8001/v1',
-						sttApiKey: 'secret-token',
+						label: 'Tailscale speech-to-text',
+						sttProvider: 'openrouter',
+						sttBaseUrl: 'https://openrouter.ai/api/v1',
+						sttApiKey: 'sk-or-secret',
 						networkScope: 'private-network',
 					},
 				],
 			},
 		});
-		expect(data.settings.activeConnectionProfileId).toBe('tailscale');
-		expect(data.settings.connectionProfiles[0]?.networkScope).toBe(
-			'private-network',
-		);
-		expect(data.settings.connectionProfiles[0]?.sttApiKey).toBe('secret-token');
+		expect(data.settings.sttProvider).toBe('openrouter');
+		expect(data.settings.sttBaseUrl).toBe('https://openrouter.ai/api/v1');
+		expect(data.settings.sttApiKey).toBe('sk-or-secret');
+		expect(data.settings.sttSplitLongRecordings).toBe(true);
+	});
+
+	it('migrates a legacy install with no explicit active profile by using the first one', () => {
+		const data = parsePluginData({
+			settings: {
+				connectionProfiles: [
+					{
+						id: 'only',
+						label: 'Only profile',
+						sttBaseUrl: 'http://127.0.0.1:8001/v1',
+						sttApiKey: 'legacy-secret',
+					},
+				],
+			},
+		});
+		expect(data.settings.sttBaseUrl).toBe('http://127.0.0.1:8001/v1');
+		expect(data.settings.sttApiKey).toBe('legacy-secret');
 	});
 
 	it('normalizes a persisted journal directory to a safe vault-relative path', () => {

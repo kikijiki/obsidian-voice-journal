@@ -20,7 +20,7 @@ The plugin has not been submitted to the community plugin directory yet, so inst
 
 ## Use
 
-1. Open the plugin settings and configure the recording source path(s), the timestamp strategy, the journal directory, a speech-to-text profile, and the coding agent.
+1. Open the plugin settings and configure the recording source path(s), the timestamp strategy, the journal directory, the speech-to-text service, and the coding agent.
 2. Run **Voice journal: Check inference providers** to verify the endpoints.
 3. Run **Voice journal: Process new voice recordings** from the command palette or the ribbon icon.
 
@@ -44,7 +44,6 @@ The single vault-structure setting. It tells the agent where the journal is. It 
 
 - `codingAgentType`: `pi`, `claude`, `codex`, or `cursor`.
 - `codingAgentExecutable`: executable name or absolute path.
-- `codingAgentProfile`: Claude agent or Codex profile. Pi and Cursor ignore it.
 - `codingAgentModel`: optional model ID understood by that CLI.
 - `codingAgentThinkingEnabled`: Pi's native `high` thinking level. Off by default.
 - `codingAgentTimeoutSeconds`: optional wall-clock limit for one agent run. `0` disables it.
@@ -54,27 +53,34 @@ The single vault-structure setting. It tells the agent where the journal is. It 
 
 The CLI owns the model endpoint and credentials through its own configuration.
 
-### Speech-to-text profiles
+### Speech-to-text
 
-A profile holds the `sttBaseUrl`, an optional `sttApiKey` sent as a bearer token, and a `networkScope` label. There is no automatic failover between profiles, because switching between loopback and another host changes the privacy boundary. Set `sttModel` to the model ID the service serves.
+- `sttProvider`: `custom` (any OpenAI-compatible endpoint) or `openrouter`. OpenRouter uses a fixed endpoint, sends audio as base64 JSON, and lists ASR-capable models for your API key.
+- `sttBaseUrl`: the endpoint for a custom provider.
+- `sttApiKey`: optional, sent as a bearer token.
+- `sttModel`: the model ID the service serves. The settings tab lists the models the endpoint reports.
+- `sttSplitLongRecordings`: on by default. Recordings over about 20 MB or 5 minutes are split with ffmpeg into parts sized to fit OpenRouter's request limits, transcribed separately, and stitched together. The same limits apply to local servers.
+- `ffmpegExecutable`: executable name or absolute path, used to read durations and split recordings.
+
+There is one speech-to-text configuration and no failover, so audio only ever goes to the endpoint you configured.
 
 ### Operational cache
 
-`artifactCacheMaxMb` bounds retained audio, raw transcripts, and STT responses. It defaults to 5120 MiB. After processing, the oldest artifacts are deleted first, and recordings in the current batch are protected.
+The plugin copies each recording into its cache so an interrupted run can resume without the original, and deletes that copy as soon as the transcript is saved. `artifactCacheMaxMb` bounds the retained raw transcripts and STT responses. It defaults to 5120 MiB. After processing, the oldest artifacts are deleted first, and recordings in the current batch are protected.
 
 ## What it writes
 
 - A journal entry in the configured journal directory, with provenance in a `voice_journal_sources` YAML list of `sha256:<hash>` values and `date` on newly created daily notes. HTML provenance comments are never used.
 - When **Add new entries** or **Update existing entries** is enabled, notes outside the journal that the recording refers to. With both off, the agent edits only the journal entry.
-- Retained audio and raw transcripts in the plugin's own `.voice-journal` cache.
+- Raw transcripts and STT responses in the plugin's own `.voice-journal` cache.
 
 The activity panel snapshots Markdown notes around each agent call and shows a diff of every change. Revert refuses to overwrite a file that was manually changed after the run.
 
 ## Privacy
 
-- Audio is sent only to the speech-to-text endpoint saved in the active profile.
+- Audio is sent only to the speech-to-text endpoint configured in the plugin settings.
 - Transcripts are sent to whatever model the selected coding agent CLI is configured to use.
-- There is no telemetry, no cloud fallback, and no automatic profile failover.
+- There is no telemetry, and no cloud fallback.
 - Activity logs are session-only and stored in the plugin-local ignored cache.
 
 ## Desktop and filesystem access

@@ -4,6 +4,18 @@
 	align-items: center;
 }
 
+/*
+ * Hides the voice_journal_sources provenance property from the rendered
+ * Properties panel when the "Hide source markers property" setting is on.
+ * Only affects rendering; raw frontmatter is untouched and still visible in
+ * Source mode. Keep the property key in sync with
+ * VOICE_JOURNAL_SOURCES_PROPERTY in src/pipeline/recording-processor.ts.
+ */
+body.voice-journal-hide-sources-property
+	.metadata-property[data-property-key='voice_journal_sources'] {
+	display: none;
+}
+
 .voice-journal-setting-warning {
 	color: var(--text-warning);
 }

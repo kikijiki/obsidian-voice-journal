@@ -2,23 +2,11 @@ export const PLUGIN_DATA_SCHEMA_VERSION = 1;
 
 export type StartupMode = 'off' | 'scan-only' | 'scan-and-process';
 export type CodingAgentType = 'pi' | 'claude' | 'codex' | 'cursor';
-export type NetworkScope =
-	| 'loopback'
-	| 'private-network'
-	| 'public-network'
-	| 'unknown';
+export type SttProviderType = 'custom' | 'openrouter';
 export type PipelineMode = 'scan-only' | 'scan-and-process';
 export type RunOrigin = 'command' | 'ribbon' | 'startup';
 export type RecordingTimestampSource = 'filename' | 'filesystem';
 export type RecordingGrouping = 'none' | 'day' | 'week' | 'month' | 'all';
-
-export interface ConnectionProfile {
-	id: string;
-	label: string;
-	sttBaseUrl: string;
-	sttApiKey: string;
-	networkScope: NetworkScope;
-}
 
 export interface RecordingSource {
 	id: string;
@@ -36,21 +24,24 @@ export interface VoiceJournalSettings {
 	schemaVersion: number;
 	startupMode: StartupMode;
 	startupDelayMs: number;
-	activeConnectionProfileId: string;
-	connectionProfiles: ConnectionProfile[];
+	sttProvider: SttProviderType;
+	sttBaseUrl: string;
+	sttApiKey: string;
+	sttModel: string;
+	sttSplitLongRecordings: boolean;
+	ffmpegExecutable: string;
 	recordingSources: RecordingSource[];
 	recordingGrouping: RecordingGrouping;
 	journalDirectory: string;
+	hideSourcesProperty: boolean;
 	codingAgentType: CodingAgentType;
 	codingAgentExecutable: string;
-	codingAgentProfile: string;
 	codingAgentModel: string;
 	codingAgentThinkingEnabled: boolean;
 	codingAgentTimeoutSeconds: number;
 	agentAddNewEntries: boolean;
 	agentUpdateExistingEntries: boolean;
 	additionalAgentInstructions: string;
-	sttModel: string;
 	artifactCacheMaxMb: number;
 	maxEntriesPerScan: number;
 }
@@ -89,6 +80,8 @@ export interface RecordingState {
 	stage: RecordingStage;
 	sourcePath: string;
 	fileName: string;
+	size?: number;
+	sourceModifiedAtMs?: number;
 	archivedAudioPath?: string;
 	transcriptPath?: string;
 	rawResponsePath?: string;
