@@ -1,4 +1,5 @@
 import type { CodingAgentType } from '../model';
+import { ClaudeOutputPresenter } from './agent-output/claude-presenter';
 import { CodexOutputPresenter } from './agent-output/codex-presenter';
 import { PiOutputPresenter } from './agent-output/pi-presenter';
 import {
@@ -25,7 +26,9 @@ class GenericOutputPresenter implements AgentProtocolPresenter {
 export function agentTurnStarted(line: string): boolean {
 	try {
 		const type = record(JSON.parse(line.trim()))?.type;
-		return type === 'turn_start' || type === 'turn.started';
+		return (
+			type === 'turn_start' || type === 'turn.started' || type === 'assistant'
+		);
 	} catch {
 		return false;
 	}
@@ -40,7 +43,9 @@ export class AgentOutputPresenter implements AgentProtocolPresenter {
 				? new PiOutputPresenter(scope)
 				: type === 'codex'
 					? new CodexOutputPresenter(scope)
-					: new GenericOutputPresenter();
+					: type === 'claude'
+						? new ClaudeOutputPresenter(scope)
+						: new GenericOutputPresenter();
 	}
 
 	push(line: string): FormattedAgentLine[] {

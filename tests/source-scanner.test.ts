@@ -222,3 +222,35 @@ describe('SourceScanner', () => {
 		expect(result.errors[0]?.message).toMatch(/entry limit/i);
 	});
 });
+
+describe('SourceScanner.scanPaths', () => {
+	it('builds a candidate directly from an explicit file path', async () => {
+		const root = await createFixtureRoot();
+		const recording = join(root, 'dropped-recording.wav');
+		await writeFile(recording, 'audio');
+
+		const result = await new SourceScanner().scanPaths([recording]);
+
+		expect(result.errors).toEqual([]);
+		expect(result.candidates).toHaveLength(1);
+		expect(result.candidates[0]).toMatchObject({
+			sourceId: 'manual',
+			absolutePath: recording,
+			fileName: 'dropped-recording.wav',
+		});
+	});
+
+	it('reports an error for a missing or non-absolute path instead of throwing', async () => {
+		const root = await createFixtureRoot();
+		const missing = join(root, 'missing.wav');
+
+		const result = await new SourceScanner().scanPaths([
+			missing,
+			'relative.wav',
+		]);
+
+		expect(result.candidates).toEqual([]);
+		expect(result.errors).toHaveLength(2);
+		expect(result.errors[1]?.message).toMatch(/absolute/i);
+	});
+});

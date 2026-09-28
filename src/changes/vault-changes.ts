@@ -123,6 +123,29 @@ export function compareVaultSnapshots(
 		});
 }
 
+/**
+ * Reconstructs the vault state from before the very first agent pass, so a
+ * follow-up run's diff still reflects the full cumulative change instead of
+ * only the delta introduced by the follow-up itself. `priorChanges` are the
+ * already-reported changes (their `before` values are the true originals);
+ * every other path is taken from `currentSnapshot`, which already holds the
+ * true original content for anything neither pass has touched yet.
+ */
+export function effectiveBaselineSnapshot(
+	currentSnapshot: VaultSnapshot,
+	priorChanges: VaultFileChange[],
+): VaultSnapshot {
+	const baseline = new Map(currentSnapshot);
+	for (const change of priorChanges) {
+		if (change.before === null) {
+			baseline.delete(change.path);
+		} else {
+			baseline.set(change.path, change.before);
+		}
+	}
+	return baseline;
+}
+
 function resolveVaultPath(vaultRoot: string, relativePath: string): string {
 	const root = resolve(vaultRoot);
 	const target = resolve(root, relativePath);

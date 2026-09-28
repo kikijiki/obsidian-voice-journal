@@ -43,7 +43,10 @@ function coordinatorWithProvider(
 		getArtifactRoot: () => '/vault/.config/plugins/test/.voice-journal',
 		saveRuntime: async () => undefined,
 		reportProgress: () => undefined,
-		scanner: { scan: async () => ({ candidates: [], errors: [], warnings: [] }) },
+		scanner: {
+			scan: async () => ({ candidates: [], errors: [], warnings: [] }),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
+		},
 		provider: { checkHealth: async (baseUrl) => ({ baseUrl, ok: true, latencyMs: 1, models: [] }), listModels },
 		agent: {
 			checkHealth: async (type) => ({ type, ok: true, latencyMs: 1 }),
@@ -119,6 +122,7 @@ describe('PipelineCoordinator', () => {
 					errors: [],
 					warnings: [],
 				}),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
 			},
 			provider: {
 				checkHealth: async (baseUrl) => ({ baseUrl, ok: true, latencyMs: 1, models: [] }),
@@ -173,6 +177,7 @@ describe('PipelineCoordinator', () => {
 					errors: [],
 					warnings: [],
 				}),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
 			},
 			provider: {
 				checkHealth: async (baseUrl) => ({ baseUrl, ok: true, latencyMs: 1, models: [] }),
@@ -241,6 +246,7 @@ describe('PipelineCoordinator', () => {
 					errors: [],
 					warnings: [],
 				}),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
 			},
 			provider: {
 				checkHealth: async (baseUrl) => ({ baseUrl, ok: true, latencyMs: 1, models: [] }),
@@ -325,6 +331,7 @@ describe('PipelineCoordinator', () => {
 						},
 					],
 				}),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
 			},
 			provider: {
 				checkHealth: async (baseUrl) => ({
@@ -390,6 +397,7 @@ describe('PipelineCoordinator', () => {
 					],
 					warnings: [],
 				}),
+			scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
 			},
 			provider: {
 				checkHealth: async (baseUrl) => ({

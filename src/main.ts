@@ -5,6 +5,7 @@ import type {
 	PersistedPluginData,
 	PipelineMode,
 	PipelineProgress,
+	PipelineRunResult,
 	CodingAgentHealth,
 	ProviderHealth,
 	ProviderHealthReport,
@@ -20,7 +21,12 @@ import { OpenAiTranscriptionProvider } from './providers/openai-transcription';
 import { parsePluginData } from './settings/model';
 import { VoiceJournalSettingTab } from './settings/tab';
 import { ActivityLog } from './activity/log';
-import { revertVaultFileChange } from './changes/vault-changes';
+import {
+	compareVaultSnapshots,
+	effectiveBaselineSnapshot,
+	revertVaultFileChange,
+	snapshotVaultNotes,
+} from './changes/vault-changes';
 import {
 	initializeArtifactStorage,
 	resolvePluginArtifactRoot,
@@ -44,7 +50,9 @@ export default class VoiceJournalPlugin extends Plugin {
 	private runtime!: RuntimeState;
 	private data!: PersistedPluginData;
 	private coordinator!: PipelineCoordinator;
+	private processor!: RecordingProcessor;
 	private agent: CodingAgentClient | null = null;
+	private followUpRunning = false;
 	private statusBarItem!: HTMLElement;
 	private progressNotice: Notice | null = null;
 	private currentProgress: PipelineProgress | null = null;
@@ -76,6 +84,10 @@ export default class VoiceJournalPlugin extends Plugin {
 		const agent = new CodingAgentClient();
 		agent.setRunTimeoutMs(this.settings.codingAgentTimeoutSeconds * 1000);
 		this.agent = agent;
+		this.processor = new RecordingProcessor(
+			new OpenAiTranscriptionProvider(requestUrl),
+			agent,
+		);
 		this.registerView(
 			VOICE_JOURNAL_ACTIVITY_VIEW,
 			(leaf) =>
@@ -96,6 +108,11 @@ export default class VoiceJournalPlugin extends Plugin {
 						this.revertAllFileChanges(eventId),
 					openVaultFile: async (path) => this.openVaultFile(path),
 					acceptChanges: async () => this.acceptChanges(),
+					getRecordingSources: () => this.settings.recordingSources,
+					processFiles: async (paths) => this.processFiles(paths),
+					sendFollowUpMessage: async (message) =>
+						this.sendFollowUpMessage(message),
+					isFollowUpRunning: () => this.followUpRunning,
 				}),
 		);
 		this.coordinator = new PipelineCoordinator({
@@ -111,10 +128,7 @@ export default class VoiceJournalPlugin extends Plugin {
 			scanner: new SourceScanner(),
 			provider: new OpenAiCompatibleProvider(requestUrl),
 			agent,
-			processor: new RecordingProcessor(
-				new OpenAiTranscriptionProvider(requestUrl),
-				agent,
-			),
+			processor: this.processor,
 		});
 
 		this.statusBarItem = this.addStatusBarItem();
@@ -237,6 +251,25 @@ export default class VoiceJournalPlugin extends Plugin {
 		mode: PipelineMode,
 		origin: RunOrigin,
 	): Promise<void> {
+		await this.executeRun(mode, origin, () =>
+			this.coordinator.run(mode, origin),
+		);
+	}
+
+	private async processFiles(absolutePaths: string[]): Promise<void> {
+		if (absolutePaths.length === 0) {
+			return;
+		}
+		await this.executeRun('scan-and-process', 'manual', () =>
+			this.coordinator.runManual(absolutePaths, 'manual'),
+		);
+	}
+
+	private async executeRun(
+		mode: PipelineMode,
+		origin: RunOrigin,
+		run: () => Promise<PipelineRunResult>,
+	): Promise<void> {
 		if (this.coordinator.isRunning()) {
 			new Notice('A voice journal pipeline run is already active.');
 			await this.openActivityView();
@@ -251,7 +284,7 @@ export default class VoiceJournalPlugin extends Plugin {
 		this.progressNotice = new Notice('Voice journal: starting…', 0);
 		this.statusBarItem.setText('Voice journal: starting…');
 		try {
-			const result = await this.coordinator.run(mode, origin);
+			const result = await run();
 			this.activity.add({
 				kind: 'run',
 				level:
@@ -444,12 +477,77 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	private async acceptChanges(): Promise<void> {
-		if (this.coordinator.isRunning()) {
+		if (this.coordinator.isRunning() || this.followUpRunning) {
 			new Notice('Wait for the voice journal run to finish.');
 			return;
 		}
 		await this.activity.clearView();
 		new Notice('Vault changes accepted.');
+	}
+
+	private async sendFollowUpMessage(message: string): Promise<void> {
+		const trimmed = message.trim();
+		if (trimmed === '') {
+			return;
+		}
+		if (this.coordinator.isRunning() || this.followUpRunning) {
+			new Notice('Wait for the voice journal run to finish.');
+			return;
+		}
+		const reportEvents = this.activity
+			.getEvents()
+			.filter((event) => event.kind === 'changes' && (event.changes?.length ?? 0) > 0);
+		if (reportEvents.length === 0) {
+			new Notice('There are no pending vault changes to follow up on.');
+			return;
+		}
+		const priorChanges = reportEvents.flatMap((event) => event.changes ?? []);
+		const changedPaths = [...new Set(priorChanges.map((change) => change.path))];
+		this.followUpRunning = true;
+		const vaultRoot = this.getVaultRoot();
+		const artifactRoot = this.getArtifactRoot();
+		const progressNotice = new Notice('Voice journal: sending follow-up…', 0);
+		try {
+			const preSnapshot = await snapshotVaultNotes(vaultRoot, artifactRoot);
+			const { agentFailure, snapshotAfter } = await this.processor.runFollowUp({
+				settings: this.settings,
+				vaultRoot,
+				artifactRoot,
+				changedPaths,
+				followUpMessage: trimmed,
+				reportActivity: (event) => this.activity.add(event),
+				reportProgress: (progress) => this.reportProgress(progress),
+			});
+			if (agentFailure !== undefined) {
+				throw agentFailure instanceof Error
+					? agentFailure
+					: new Error('The coding agent failed to apply the follow-up.');
+			}
+			const baseline = effectiveBaselineSnapshot(preSnapshot, priorChanges);
+			const changes = compareVaultSnapshots(baseline, snapshotAfter);
+			const [primary, ...superseded] = reportEvents;
+			if (primary !== undefined) {
+				this.activity.updateChanges(primary.id, changes);
+			}
+			for (const event of superseded) {
+				this.activity.updateChanges(event.id, []);
+			}
+			new Notice(
+				changes.length > 0
+					? `Follow-up applied: ${changes.length.toString()} file(s) changed.`
+					: 'Follow-up applied: no file changes detected.',
+			);
+		} catch (error) {
+			new Notice(
+				error instanceof Error ? error.message : 'The follow-up request failed.',
+				8000,
+			);
+		} finally {
+			progressNotice.hide();
+			this.currentProgress = null;
+			this.updateStatusBar();
+			this.followUpRunning = false;
+		}
 	}
 
 	private async openActivityView(): Promise<void> {

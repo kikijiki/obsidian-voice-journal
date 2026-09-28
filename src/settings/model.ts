@@ -191,7 +191,10 @@ function parseLastRun(value: unknown): RuntimeState['lastRun'] {
 	const mode = value.mode;
 	const status = value.status;
 	if (
-		(origin !== 'command' && origin !== 'ribbon' && origin !== 'startup') ||
+		(origin !== 'command' &&
+			origin !== 'ribbon' &&
+			origin !== 'startup' &&
+			origin !== 'manual') ||
 		(mode !== 'scan-only' && mode !== 'scan-and-process') ||
 		(status !== 'succeeded' && status !== 'failed' && status !== 'cancelled')
 	) {

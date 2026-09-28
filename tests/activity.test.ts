@@ -309,6 +309,142 @@ describe('AgentOutputPresenter', () => {
 			replaceKey: editStarted?.replaceKey,
 		});
 	});
+
+	it('hides Claude protocol noise and presents assistant text', () => {
+		const presenter = new AgentOutputPresenter('claude');
+		expect(
+			presenter.push(
+				'{"type":"system","subtype":"init","session_id":"abc","cwd":"/vault"}',
+			),
+		).toEqual([]);
+		expect(agentTurnStarted('{"type":"system","subtype":"init"}')).toBe(false);
+		expect(agentTurnStarted('{"type":"assistant"}')).toBe(true);
+		const [message] = presenter.push(
+			'{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I checked the existing notes."}]}}',
+		);
+		expect(message).toMatchObject({
+			title: 'Agent response',
+			message: 'I checked the existing notes.',
+			presentation: 'message',
+			status: 'succeeded',
+			persist: true,
+		});
+		expect(
+			presenter.push(
+				'{"type":"result","subtype":"success","is_error":false,"result":"Done."}',
+			),
+		).toEqual([]);
+	});
+
+	it('folds Claude tool_use/tool_result pairs into one readable tool row', () => {
+		const presenter = new AgentOutputPresenter('claude', 'recording');
+		const started = presenter.push(
+			JSON.stringify({
+				type: 'assistant',
+				message: {
+					role: 'assistant',
+					content: [
+						{
+							type: 'tool_use',
+							id: 'toolu_1',
+							name: 'Read',
+							input: { file_path: 'Journal/2026/03/2026-03-31.md' },
+						},
+					],
+				},
+			}),
+		)[0];
+		expect(started).toMatchObject({
+			title: 'Read',
+			message: 'Journal/2026/03/2026-03-31.md',
+			presentation: 'tool',
+			icon: 'file-text',
+			status: 'running',
+			persist: false,
+		});
+
+		const finished = presenter.push(
+			JSON.stringify({
+				type: 'user',
+				message: {
+					role: 'user',
+					content: [
+						{
+							type: 'tool_result',
+							tool_use_id: 'toolu_1',
+							content: [{ type: 'text', text: '# Journal entry\n' }],
+							is_error: false,
+						},
+					],
+				},
+			}),
+		)[0];
+		expect(finished).toMatchObject({
+			title: 'Read',
+			message: 'Journal/2026/03/2026-03-31.md',
+			status: 'succeeded',
+			replaceKey: started?.replaceKey,
+			persist: true,
+		});
+		expect(finished?.detail).toContain('Output\n# Journal entry');
+	});
+
+	it('presents Claude tool failures as warnings', () => {
+		const presenter = new AgentOutputPresenter('claude');
+		presenter.push(
+			JSON.stringify({
+				type: 'assistant',
+				message: {
+					role: 'assistant',
+					content: [
+						{
+							type: 'tool_use',
+							id: 'toolu_9',
+							name: 'Grep',
+							input: { pattern: 'missing', path: 'Journal' },
+						},
+					],
+				},
+			}),
+		);
+		const failure = presenter.push(
+			JSON.stringify({
+				type: 'user',
+				message: {
+					role: 'user',
+					content: [
+						{
+							type: 'tool_result',
+							tool_use_id: 'toolu_9',
+							content: 'No matches',
+							is_error: true,
+						},
+					],
+				},
+			}),
+		)[0];
+		expect(failure).toMatchObject({
+			level: 'warning',
+			status: 'warning',
+		});
+	});
+
+	it('reports interrupted Claude tool calls on flush', () => {
+		const presenter = new AgentOutputPresenter('claude');
+		presenter.push(
+			JSON.stringify({
+				type: 'assistant',
+				message: {
+					role: 'assistant',
+					content: [
+						{ type: 'tool_use', id: 'toolu_2', name: 'Edit', input: { file_path: 'a.md' } },
+					],
+				},
+			}),
+		);
+		const [flushed] = presenter.flush();
+		expect(flushed).toMatchObject({ status: 'interrupted', level: 'warning' });
+	});
 });
 
 describe('ActivityLog', () => {

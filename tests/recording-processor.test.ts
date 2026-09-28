@@ -912,4 +912,68 @@ describe('RecordingProcessor', () => {
 
 		expect(activity.some((event) => event.kind === 'changes')).toBe(false);
 	});
+
+	it('sends a follow-up prompt to the agent and reports the resulting snapshot', async () => {
+		const { vaultRoot, artifactRoot, settings } = await fixture();
+		await mkdir(join(vaultRoot, 'Journal'), { recursive: true });
+		await writeFile(join(vaultRoot, 'Journal', '2026-03-31.md'), 'first pass\n');
+
+		let capturedPrompt = '';
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, vaultPath: string, prompt: string) => {
+				capturedPrompt = prompt;
+				await writeFile(
+					join(vaultPath, 'Journal', '2026-03-31.md'),
+					'first pass, now revised\n',
+				);
+				return { stdout: '', stderr: '' };
+			},
+		);
+		const activity: NewActivityEvent[] = [];
+		const progress: PipelineProgress[] = [];
+		const processor = new RecordingProcessor(
+			{ transcribe: async () => ({ text: '', segments: [], rawResponse: {} }) },
+			{ run },
+		);
+
+		const result = await processor.runFollowUp({
+			settings,
+			vaultRoot,
+			artifactRoot,
+			changedPaths: ['Journal/2026-03-31.md'],
+			followUpMessage: 'Mention that it was raining.',
+			reportActivity: (event) => activity.push(event),
+			reportProgress: (update) => progress.push(update),
+		});
+
+		expect(capturedPrompt).toContain('Journal/2026-03-31.md');
+		expect(capturedPrompt).toContain('Mention that it was raining.');
+		expect(result.agentFailure).toBeUndefined();
+		expect(result.snapshotAfter.get('Journal/2026-03-31.md')).toBe(
+			'first pass, now revised\n',
+		);
+		expect(progress.some((update) => update.stage === 'editing-vault')).toBe(true);
+	});
+
+	it('reports the agent failure from a follow-up without throwing', async () => {
+		const { vaultRoot, artifactRoot, settings } = await fixture();
+		const run = vi.fn(async () => {
+			throw new Error('agent crashed');
+		});
+		const processor = new RecordingProcessor(
+			{ transcribe: async () => ({ text: '', segments: [], rawResponse: {} }) },
+			{ run },
+		);
+
+		const result = await processor.runFollowUp({
+			settings,
+			vaultRoot,
+			artifactRoot,
+			changedPaths: [],
+			followUpMessage: 'Fix it.',
+		});
+
+		expect(result.agentFailure).toBeInstanceOf(Error);
+		expect((result.agentFailure as Error).message).toBe('agent crashed');
+	});
 });

@@ -1,4 +1,4 @@
-import { ItemView, Modal, Setting, setIcon } from 'obsidian';
+import { ItemView, Modal, Notice, Setting, setIcon } from 'obsidian';
 import type { App, WorkspaceLeaf } from 'obsidian';
 import { codingAgentName } from '../agents/coding-agent';
 import type { ActivityEvent, ActivityKind, ActivityLog } from '../activity/log';
@@ -6,6 +6,7 @@ import type {
 	CodingAgentHealth,
 	PipelineProgress,
 	ProviderHealth,
+	RecordingSource,
 } from '../model';
 import {
 	classifyDiffLine,
@@ -29,6 +30,52 @@ export interface ActivityViewHost {
 	revertAllFileChanges: (eventId: string) => Promise<void>;
 	openVaultFile: (path: string) => Promise<void>;
 	acceptChanges: () => Promise<void>;
+	getRecordingSources: () => RecordingSource[];
+	processFiles: (absolutePaths: string[]) => Promise<void>;
+	sendFollowUpMessage: (message: string) => Promise<void>;
+	isFollowUpRunning: () => boolean;
+}
+
+const AUDIO_FILE_EXTENSIONS = [
+	'.wav',
+	'.mp3',
+	'.m4a',
+	'.flac',
+	'.ogg',
+	'.aac',
+	'.webm',
+	'.opus',
+];
+
+function electronFilePath(file: File): string | undefined {
+	const path = (file as File & { path?: string }).path;
+	return typeof path === 'string' && path !== '' ? path : undefined;
+}
+
+function hasAudioExtension(fileName: string): boolean {
+	const lowered = fileName.toLowerCase();
+	return AUDIO_FILE_EXTENSIONS.some((extension) => lowered.endsWith(extension));
+}
+
+function filePathsFromFileList(files: FileList): {
+	paths: string[];
+	skipped: number;
+} {
+	const paths: string[] = [];
+	let skipped = 0;
+	for (const file of Array.from(files)) {
+		const path = electronFilePath(file);
+		if (path === undefined) {
+			skipped += 1;
+			continue;
+		}
+		if (!hasAudioExtension(file.name)) {
+			skipped += 1;
+			continue;
+		}
+		paths.push(path);
+	}
+	return { paths, skipped };
 }
 
 type ServiceHealthState = 'checking' | 'ready' | 'unavailable';
@@ -110,6 +157,10 @@ export class VoiceJournalActivityView extends ItemView {
 	private feedEl: HTMLElement | null = null;
 	private changeReportsEl: HTMLElement | null = null;
 	private failureReportEl: HTMLElement | null = null;
+	private sourcesEl: HTMLElement | null = null;
+	private fileInputEl: HTMLInputElement | null = null;
+	private followUpTextarea: HTMLTextAreaElement | null = null;
+	private followUpSending = false;
 	private statusEl: HTMLElement | null = null;
 	private runButton: HTMLButtonElement | null = null;
 	private sttIndicator: ServiceIndicator | null = null;
@@ -149,7 +200,10 @@ export class VoiceJournalActivityView extends ItemView {
 			this.renderFeed();
 		});
 		this.registerInterval(
-			window.setInterval(() => this.renderStatus(), 1_000),
+			window.setInterval(() => {
+				this.renderStatus();
+				this.renderSources();
+			}, 1_000),
 		);
 		this.registerInterval(
 			window.setInterval(() => {
@@ -167,6 +221,9 @@ export class VoiceJournalActivityView extends ItemView {
 		this.sttIndicator = null;
 		this.agentIndicator = null;
 		this.failureReportEl = null;
+		this.sourcesEl = null;
+		this.fileInputEl = null;
+		this.followUpTextarea = null;
 	}
 
 	private renderShell(): void {
@@ -193,6 +250,24 @@ export class VoiceJournalActivityView extends ItemView {
 				void this.host.runPipeline();
 			}
 		});
+		const addButton = actions.createEl('button', {
+			attr: { 'aria-label': 'Open or add recordings directly, bypassing watched folders' },
+		});
+		setIcon(addButton, 'file-plus-2');
+		addButton.addEventListener('click', () => this.fileInputEl?.click());
+		this.fileInputEl = actions.createEl('input', {
+			cls: 'voice-journal-activity__file-input',
+			attr: { type: 'file', multiple: 'multiple', accept: AUDIO_FILE_EXTENSIONS.join(',') },
+		});
+		this.fileInputEl.addEventListener('change', () => {
+			const input = this.fileInputEl;
+			if (input?.files != null) {
+				this.submitFiles(input.files);
+			}
+			if (input !== null) {
+				input.value = '';
+			}
+		});
 		const clearButton = actions.createEl('button', {
 			attr: { 'aria-label': 'Clear the visible activity' },
 		});
@@ -206,6 +281,8 @@ export class VoiceJournalActivityView extends ItemView {
 		setIcon(settingsButton, 'settings');
 		settingsButton.addEventListener('click', () => this.host.openSettings());
 
+		this.registerDropZone(root);
+
 		const services = root.createDiv({
 			cls: 'voice-journal-activity__services',
 			attr: {
@@ -215,6 +292,9 @@ export class VoiceJournalActivityView extends ItemView {
 		});
 		this.sttIndicator = this.createServiceIndicator(services, 'STT');
 		this.agentIndicator = this.createServiceIndicator(services, 'Agent');
+
+		this.sourcesEl = root.createDiv({ cls: 'voice-journal-activity__sources' });
+		this.renderSources();
 
 		this.failureReportEl = root.createDiv({
 			cls: 'voice-journal-activity__failure-highlight',
@@ -264,6 +344,102 @@ export class VoiceJournalActivityView extends ItemView {
 		this.renderFailureReport();
 		this.renderChangeReports();
 		this.renderFeed();
+	}
+
+	private registerDropZone(root: HTMLElement): void {
+		let dragDepth = 0;
+		root.addEventListener('dragenter', (event) => {
+			if (!(event.dataTransfer?.types.includes('Files') ?? false)) {
+				return;
+			}
+			event.preventDefault();
+			dragDepth += 1;
+			root.toggleClass('is-drag-over', true);
+		});
+		root.addEventListener('dragover', (event) => {
+			if (!(event.dataTransfer?.types.includes('Files') ?? false)) {
+				return;
+			}
+			event.preventDefault();
+		});
+		root.addEventListener('dragleave', () => {
+			dragDepth = Math.max(0, dragDepth - 1);
+			if (dragDepth === 0) {
+				root.toggleClass('is-drag-over', false);
+			}
+		});
+		root.addEventListener('drop', (event) => {
+			if (!(event.dataTransfer?.types.includes('Files') ?? false)) {
+				return;
+			}
+			event.preventDefault();
+			dragDepth = 0;
+			root.toggleClass('is-drag-over', false);
+			const files = event.dataTransfer?.files;
+			if (files != null) {
+				this.submitFiles(files);
+			}
+		});
+	}
+
+	private submitFiles(files: FileList): void {
+		const { paths, skipped } = filePathsFromFileList(files);
+		if (paths.length === 0) {
+			new Notice(
+				skipped > 0
+					? 'None of the dropped files look like audio recordings.'
+					: 'Could not read a filesystem path for the dropped file(s).',
+			);
+			return;
+		}
+		if (skipped > 0) {
+			new Notice(
+				`Skipped ${skipped.toString()} file(s) that don't look like audio recordings.`,
+			);
+		}
+		void this.host.processFiles(paths);
+	}
+
+	private renderSources(): void {
+		const container = this.sourcesEl;
+		if (container === null) {
+			return;
+		}
+		const sources = this.host.getRecordingSources();
+		container.empty();
+		if (sources.length === 0) {
+			return;
+		}
+		const header = container.createDiv({
+			cls: 'voice-journal-activity__sources-header',
+		});
+		const icon = header.createSpan();
+		setIcon(icon, 'folder-open');
+		header.createSpan({ text: 'Watched folders' });
+		header.createSpan({
+			cls: 'voice-journal-activity__sources-count',
+			text: `${sources.length.toString()}`,
+		});
+		const list = container.createDiv({
+			cls: 'voice-journal-activity__sources-list',
+		});
+		for (const source of sources) {
+			const row = list.createDiv({
+				cls: 'voice-journal-activity__sources-item',
+				attr: { title: source.path === '' ? 'Path not configured.' : source.path },
+			});
+			const rowIcon = row.createSpan();
+			setIcon(rowIcon, source.path === '' ? 'triangle-alert' : 'folder');
+			row.toggleClass('is-warning', source.path === '');
+			row.createSpan({
+				cls: 'voice-journal-activity__sources-name',
+				text: source.name === '' ? 'Unnamed source' : source.name,
+			});
+			row.createSpan({
+				cls: 'voice-journal-activity__sources-path',
+				text: source.path === '' ? 'Path not configured' : source.path,
+			});
+		}
 	}
 
 	private renderFailureReport(): void {
@@ -526,10 +702,17 @@ export class VoiceJournalActivityView extends ItemView {
 		if (container === null) {
 			return;
 		}
-		const reports = this.events.filter((event) => event.kind === 'changes');
+		const reports = this.events.filter(
+			(event) => event.kind === 'changes' && (event.changes?.length ?? 0) > 0,
+		);
+		// Capture the follow-up composer's live value/focus before the rebuild
+		// below tears it down, so an in-progress agent run streaming activity
+		// events doesn't wipe out what the user is typing.
+		const preserved = this.captureFollowUpComposerState();
 		container.empty();
 		container.hidden = reports.length === 0;
 		if (reports.length === 0) {
+			this.followUpTextarea = null;
 			return;
 		}
 		const header = container.createDiv({
@@ -546,20 +729,115 @@ export class VoiceJournalActivityView extends ItemView {
 			cls: 'voice-journal-activity__changes-count',
 			text: `${changedCount.toString()} file change${changedCount === 1 ? '' : 's'}`,
 		});
+		const busy =
+			this.host.isRunning() || this.followUpSending || this.host.isFollowUpRunning();
 		const accept = header.createEl('button', {
 			cls: 'voice-journal-activity__accept-changes mod-cta',
 			text: 'Accept changes',
 			attr: { 'aria-label': 'Accept vault changes and clear this activity' },
 		});
-		accept.disabled = this.host.isRunning();
+		accept.disabled = busy;
 		accept.addEventListener('click', () => {
 			void this.acceptReportedChanges();
 		});
+		this.renderFollowUpComposer(container, busy, preserved);
 		for (const report of reports) {
 			const card = container.createDiv({
 				cls: 'voice-journal-activity__change-card',
 			});
-			this.renderChangeReport(card, report);
+			this.renderChangeReport(card, report, busy);
+		}
+	}
+
+	private captureFollowUpComposerState(): {
+		value: string;
+		selectionStart: number | null;
+		selectionEnd: number | null;
+		focused: boolean;
+	} | null {
+		const textarea = this.followUpTextarea;
+		if (textarea === null) {
+			return null;
+		}
+		return {
+			value: textarea.value,
+			selectionStart: textarea.selectionStart,
+			selectionEnd: textarea.selectionEnd,
+			focused: document.activeElement === textarea,
+		};
+	}
+
+	private renderFollowUpComposer(
+		parent: HTMLElement,
+		busy: boolean,
+		preserved: {
+			value: string;
+			selectionStart: number | null;
+			selectionEnd: number | null;
+			focused: boolean;
+		} | null,
+	): void {
+		const composer = parent.createDiv({
+			cls: 'voice-journal-activity__follow-up',
+		});
+		const textarea = composer.createEl('textarea', {
+			cls: 'voice-journal-activity__follow-up-input',
+			attr: {
+				placeholder:
+					'Ask the agent for changes before accepting — e.g. "move this under the poncle note instead"…',
+				rows: '2',
+			},
+		});
+		const send = composer.createEl('button', {
+			cls: 'voice-journal-activity__follow-up-send mod-cta',
+			text: this.followUpSending ? 'Sending…' : 'Send',
+			attr: { 'aria-label': 'Send follow-up feedback to the coding agent' },
+		});
+		const submit = (): void => {
+			const message = textarea.value.trim();
+			if (message === '' || this.followUpSending) {
+				return;
+			}
+			this.followUpSending = true;
+			textarea.disabled = true;
+			send.disabled = true;
+			send.setText('Sending…');
+			this.host
+				.sendFollowUpMessage(message)
+				.then(() => {
+					textarea.value = '';
+				})
+				.catch(() => undefined)
+				.finally(() => {
+					this.followUpSending = false;
+					this.renderChangeReports();
+				});
+		};
+		textarea.disabled = busy;
+		send.disabled = busy || textarea.value.trim() === '';
+		textarea.addEventListener('input', () => {
+			send.disabled = busy || textarea.value.trim() === '';
+		});
+		textarea.addEventListener('keydown', (event) => {
+			if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+				event.preventDefault();
+				submit();
+			}
+		});
+		send.addEventListener('click', () => submit());
+		this.followUpTextarea = textarea;
+		if (preserved !== null) {
+			textarea.value = preserved.value;
+			send.disabled = busy || textarea.value.trim() === '';
+			if (preserved.focused) {
+				textarea.focus();
+				if (preserved.selectionStart !== null && preserved.selectionEnd !== null) {
+					textarea.setSelectionRange(
+						preserved.selectionStart,
+						preserved.selectionEnd,
+					);
+				}
+			}
 		}
 	}
 
@@ -606,7 +884,11 @@ export class VoiceJournalActivityView extends ItemView {
 		this.renderCompactEvent(row, event);
 	}
 
-	private renderChangeReport(parent: HTMLElement, event: ActivityEvent): void {
+	private renderChangeReport(
+		parent: HTMLElement,
+		event: ActivityEvent,
+		busy: boolean,
+	): void {
 		parent.addClass('voice-journal-activity__change-report');
 		const changes = event.changes ?? [];
 		const pending = changes.filter((change) => change.reverted !== true);
@@ -638,7 +920,7 @@ export class VoiceJournalActivityView extends ItemView {
 			text: 'Revert all',
 			attr: { 'aria-label': 'Revert all changes in this report' },
 		});
-		revertAll.disabled = pending.length === 0;
+		revertAll.disabled = pending.length === 0 || busy;
 		revertAll.addEventListener('click', () => {
 			void this.confirmRevert(
 				'Revert all vault changes?',
@@ -659,7 +941,7 @@ export class VoiceJournalActivityView extends ItemView {
 			cls: 'voice-journal-activity__change-list',
 		});
 		for (const change of changes) {
-			this.renderFileChange(list, event.id, change);
+			this.renderFileChange(list, event.id, change, busy);
 		}
 	}
 
@@ -667,6 +949,7 @@ export class VoiceJournalActivityView extends ItemView {
 		parent: HTMLElement,
 		eventId: string,
 		change: VaultFileChange,
+		busy: boolean,
 	): void {
 		const detailId = `${eventId}:${change.path}`;
 		const row = parent.createDiv({
@@ -705,7 +988,7 @@ export class VoiceJournalActivityView extends ItemView {
 				attr: { 'aria-label': `Open ${change.path}` },
 			});
 			setIcon(open, 'external-link');
-			open.disabled = change.kind === 'created' && change.reverted === true;
+			open.disabled = (change.kind === 'created' && change.reverted === true) || busy;
 			open.addEventListener('click', (clickEvent) => {
 				clickEvent.stopPropagation();
 				void this.host.openVaultFile(change.path);
@@ -716,7 +999,7 @@ export class VoiceJournalActivityView extends ItemView {
 			attr: { 'aria-label': `Revert ${change.path}` },
 		});
 		setIcon(revert, 'undo-2');
-		revert.disabled = change.reverted === true;
+		revert.disabled = change.reverted === true || busy;
 		revert.addEventListener('click', (clickEvent) => {
 			clickEvent.stopPropagation();
 			void this.confirmRevert(

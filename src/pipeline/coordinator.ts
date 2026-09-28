@@ -28,6 +28,7 @@ interface Scanner {
 		sources: VoiceJournalSettings['recordingSources'],
 		maxEntries: number,
 	): Promise<ScanResult>;
+	scanPaths(absolutePaths: string[]): Promise<ScanResult>;
 }
 
 interface HealthProvider {
@@ -72,6 +73,26 @@ export interface PipelineDependencies {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown pipeline error.';
+}
+
+interface RunCounters {
+	candidateCount: number;
+	processedCount: number;
+	skippedCount: number;
+	processingFailureCount: number;
+	scanErrorCount: number;
+	warningCount: number;
+}
+
+function freshCounters(): RunCounters {
+	return {
+		candidateCount: 0,
+		processedCount: 0,
+		skippedCount: 0,
+		processingFailureCount: 0,
+		scanErrorCount: 0,
+		warningCount: 0,
+	};
 }
 
 function localDateKey(timestampMs: number): string {
@@ -185,15 +206,8 @@ export class PipelineCoordinator {
 		this.running = true;
 		this.cancelRequested = false;
 		const startedAt = new Date();
-		const runtime = this.dependencies.getRuntime();
-		let candidateCount = 0;
-		let processedCount = 0;
-		let skippedCount = 0;
-		let processingFailureCount = 0;
-		let scanErrorCount = 0;
-		let warningCount = 0;
+		const counters = freshCounters();
 		const issues: RunIssue[] = [];
-
 		try {
 			const settings = this.dependencies.getSettings();
 			this.dependencies.reportProgress({
@@ -204,270 +218,164 @@ export class PipelineCoordinator {
 				settings.recordingSources,
 				settings.maxEntriesPerScan,
 			);
-			candidateCount = scan.candidates.length;
-			scanErrorCount = scan.errors.length;
-			warningCount = scan.warnings.length;
+			return await this.processScan(scan, mode, origin, startedAt, counters, issues);
+		} catch (error) {
+			return await this.finishWithFatalError(
+				error,
+				origin,
+				mode,
+				startedAt,
+				counters,
+				issues,
+			);
+		} finally {
+			this.running = false;
+		}
+	}
+
+	/** Processes recordings picked directly in the activity panel, bypassing configured watched folders. */
+	async runManual(
+		absolutePaths: string[],
+		origin: RunOrigin,
+	): Promise<PipelineRunResult> {
+		if (this.running) {
+			throw new Error('A voice journal pipeline run is already active.');
+		}
+		this.running = true;
+		this.cancelRequested = false;
+		const startedAt = new Date();
+		const counters = freshCounters();
+		const issues: RunIssue[] = [];
+		const mode: PipelineMode = 'scan-and-process';
+		try {
+			this.dependencies.reportProgress({
+				stage: 'scanning',
+				message: 'Preparing the selected recording(s)…',
+			});
+			const scan = await this.dependencies.scanner.scanPaths(absolutePaths);
+			return await this.processScan(scan, mode, origin, startedAt, counters, issues);
+		} catch (error) {
+			return await this.finishWithFatalError(
+				error,
+				origin,
+				mode,
+				startedAt,
+				counters,
+				issues,
+			);
+		} finally {
+			this.running = false;
+		}
+	}
+
+	private async finishWithFatalError(
+		error: unknown,
+		origin: RunOrigin,
+		mode: PipelineMode,
+		startedAt: Date,
+		counters: RunCounters,
+		issues: RunIssue[],
+	): Promise<never> {
+		const runtime = this.dependencies.getRuntime();
+		const fatalError = errorMessage(error);
+		issues.push({ severity: 'error', path: '', message: fatalError });
+		const summary = this.makeSummary({
+			startedAt,
+			origin,
+			mode,
+			candidateCount: counters.candidateCount,
+			processedCount: counters.processedCount,
+			skippedCount: counters.skippedCount,
+			processingFailureCount: counters.processingFailureCount,
+			scanErrorCount: counters.scanErrorCount,
+			warningCount: counters.warningCount,
+			errorCount: Math.max(
+				1,
+				counters.processingFailureCount + counters.scanErrorCount,
+			),
+			message: fatalError,
+			issues,
+			status: 'failed',
+		});
+		await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
+		this.dependencies.reportProgress({
+			stage: 'failed',
+			message: summary.message,
+		});
+		throw error;
+	}
+
+	private async processScan(
+		scan: ScanResult,
+		mode: PipelineMode,
+		origin: RunOrigin,
+		startedAt: Date,
+		counters: RunCounters,
+		issues: RunIssue[],
+	): Promise<PipelineRunResult> {
+		const settings = this.dependencies.getSettings();
+		const runtime = this.dependencies.getRuntime();
+		let candidateCount = scan.candidates.length;
+		let processedCount = 0;
+		let skippedCount = 0;
+		let processingFailureCount = 0;
+		let scanErrorCount = scan.errors.length;
+		let warningCount = scan.warnings.length;
+		// Kept in sync so a fatal error thrown from this method still reports
+		// accurate progress via the shared counters object.
+		counters.candidateCount = candidateCount;
+		counters.scanErrorCount = scanErrorCount;
+		counters.warningCount = warningCount;
+		this.dependencies.reportActivity?.({
+			kind: 'pipeline',
+			title: 'Source scan complete',
+			message: `Found ${candidateCount.toString()} recording(s).`,
+			stage: 'scanning',
+		});
+		for (const candidate of scan.candidates) {
 			this.dependencies.reportActivity?.({
 				kind: 'pipeline',
-				title: 'Source scan complete',
-				message: `Found ${candidateCount.toString()} recording(s).`,
+				title: 'Recording detected',
+				message: `${candidate.relativePath} · ${candidate.size.toLocaleString()} bytes · ${formatLocalTimestamp(candidate.recordedAtMs)}`,
+				fileName: candidate.fileName,
 				stage: 'scanning',
 			});
-			for (const candidate of scan.candidates) {
-				this.dependencies.reportActivity?.({
-					kind: 'pipeline',
-					title: 'Recording detected',
-					message: `${candidate.relativePath} · ${candidate.size.toLocaleString()} bytes · ${formatLocalTimestamp(candidate.recordedAtMs)}`,
-					fileName: candidate.fileName,
-					stage: 'scanning',
-				});
-			}
-			for (const warning of scan.warnings) {
-				this.dependencies.reportActivity?.({
-					kind: 'pipeline',
-					level: 'warning',
-					title: 'Scan warning',
-					message: warning.message,
-					fileName: warning.path,
-					stage: 'scanning',
-				});
-			}
-			for (const error of scan.errors) {
-				this.dependencies.reportActivity?.({
-					kind: 'pipeline',
-					level: 'error',
-					title: 'Scan error',
-					message: error.message,
-					fileName: error.path,
-					stage: 'scanning',
-				});
-			}
-			issues.push(
-				...scan.errors.map((error) => ({
-					severity: 'error' as const,
-					path: error.path,
-					message: error.message,
-				})),
-				...scan.warnings.map((warning) => ({
-					severity: 'warning' as const,
-					path: warning.path,
-					message: warning.message,
-				})),
-			);
+		}
+		for (const warning of scan.warnings) {
+			this.dependencies.reportActivity?.({
+				kind: 'pipeline',
+				level: 'warning',
+				title: 'Scan warning',
+				message: warning.message,
+				fileName: warning.path,
+				stage: 'scanning',
+			});
+		}
+		for (const error of scan.errors) {
+			this.dependencies.reportActivity?.({
+				kind: 'pipeline',
+				level: 'error',
+				title: 'Scan error',
+				message: error.message,
+				fileName: error.path,
+				stage: 'scanning',
+			});
+		}
+		issues.push(
+			...scan.errors.map((error) => ({
+				severity: 'error' as const,
+				path: error.path,
+				message: error.message,
+			})),
+			...scan.warnings.map((warning) => ({
+				severity: 'warning' as const,
+				path: warning.path,
+				message: warning.message,
+			})),
+		);
 
-			if (mode === 'scan-only') {
-				const errorCount = scanErrorCount;
-				const summary = this.makeSummary({
-					startedAt,
-					origin,
-					mode,
-					candidateCount,
-					processedCount,
-					skippedCount,
-					processingFailureCount,
-					scanErrorCount,
-					warningCount,
-					errorCount,
-					issues,
-					message: `Found ${candidateCount.toString()} recording(s), ${scanErrorCount.toString()} scan error(s), ${warningCount.toString()} timestamp warning(s).`,
-				});
-				await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
-				this.dependencies.reportProgress({
-					stage: scanErrorCount === 0 ? 'complete' : 'failed',
-					message: summary.message,
-				});
-				return { scan, summary };
-			}
-			if (scanErrorCount > 0) {
-				const message = `Stopped before processing because ${scanErrorCount.toString()} source scan error${scanErrorCount === 1 ? '' : 's'} occurred.`;
-				const summary = this.makeSummary({
-					startedAt,
-					origin,
-					mode,
-					candidateCount,
-					processedCount,
-					skippedCount,
-					processingFailureCount,
-					scanErrorCount,
-					warningCount,
-					errorCount: scanErrorCount,
-					issues,
-					message,
-					status: 'failed',
-				});
-				await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
-				this.dependencies.reportProgress({
-					stage: 'failed',
-					message,
-				});
-				return { scan, summary };
-			}
-
-			let providers: ProviderHealthReport | undefined;
-			if (candidateCount > 0) {
-				this.dependencies.reportProgress({
-					stage: 'checking-services',
-					message: 'Checking speech-to-text and coding-agent services…',
-				});
-				providers = await this.checkProviders();
-				const unavailable = [
-					providers.stt.ok
-						? undefined
-						: `Speech-to-text service unavailable: ${providers.stt.error ?? 'health check failed'}`,
-					providers.agent.ok
-						? undefined
-						: `Coding agent unavailable: ${providers.agent.error ?? 'health check failed'}`,
-				].filter((message): message is string => message !== undefined);
-				if (unavailable.length > 0) {
-					throw new Error(unavailable.join(' '));
-				}
-			}
-
-			const groups = groupRecordingCandidates(
-				scan.candidates,
-				settings.recordingGrouping,
-			);
-			const statesByFileName = new Map<string, RecordingState[]>();
-			for (const state of Object.values(runtime.recordings)) {
-				const bucket = statesByFileName.get(state.fileName) ?? [];
-				bucket.push(state);
-				statesByFileName.set(state.fileName, bucket);
-			}
-			let candidateIndex = 0;
-			for (const group of groups) {
-				if (this.cancelRequested) {
-					break;
-				}
-				const positions = new Map<AudioCandidate, number>();
-				const inputs = group.map((candidate, groupIndex) => {
-					const position = candidateIndex + groupIndex + 1;
-					positions.set(candidate, position);
-					const decorateProgress = (progress: PipelineProgress): void => {
-						this.dependencies.reportProgress({
-							...progress,
-							current: position,
-							total: candidateCount,
-						});
-					};
-					return {
-						candidate,
-						settings,
-						sttBaseUrl: settings.sttBaseUrl,
-						sttApiKey: settings.sttApiKey,
-						sttRequestFormat:
-							settings.sttProvider === 'openrouter'
-								? ('json-base64' as const)
-								: undefined,
-						splitLongRecordings: settings.sttSplitLongRecordings,
-						ffmpegExecutable: settings.ffmpegExecutable,
-						vaultRoot: this.dependencies.getVaultRoot(),
-						artifactRoot: this.dependencies.getArtifactRoot(),
-						findState: (hash: string) => runtime.recordings[hash],
-						findStateByFingerprint: (target: AudioCandidate) =>
-							statesByFileName
-								.get(target.fileName)
-								?.find(
-									(state) =>
-										state.size === target.size &&
-										state.sourceModifiedAtMs === target.modifiedAtMs,
-								),
-						// Mutates the live state so the fingerprint is persisted by the
-						// end-of-run save instead of writing once per skipped recording.
-						recordFingerprint: (state: RecordingState, target: AudioCandidate) => {
-							state.size = target.size;
-							state.sourceModifiedAtMs = target.modifiedAtMs;
-							state.sourcePath = target.absolutePath;
-							state.fileName = target.fileName;
-						},
-						saveState: async (state: RecordingState) => {
-							runtime.recordings[state.hash] = state;
-							await this.dependencies.saveRuntime(runtime);
-						},
-						reportProgress: decorateProgress,
-						reportActivity: this.dependencies.reportActivity,
-						isCancelled: () => this.cancelRequested,
-					};
-				});
-				let groupFailed = false;
-				try {
-					const outcomes = await this.dependencies.processor.processBatch(inputs);
-					for (const outcome of outcomes) {
-						if (outcome.result === 'skipped') {
-							skippedCount += 1;
-						} else if (outcome.result === 'processed') {
-							processedCount += 1;
-						} else {
-							groupFailed = true;
-							processingFailureCount += 1;
-							const message = errorMessage(outcome.error);
-							issues.push({
-								severity: 'error',
-								path: outcome.candidate.absolutePath,
-								message,
-							});
-							this.dependencies.reportProgress({
-								stage: 'failed',
-								message,
-								fileName: outcome.candidate.fileName,
-								current: positions.get(outcome.candidate),
-								total: candidateCount,
-							});
-						}
-					}
-				} catch (error) {
-					if (this.cancelRequested) {
-						break;
-					}
-					groupFailed = true;
-					const message = errorMessage(error);
-					for (const candidate of group) {
-						processingFailureCount += 1;
-						issues.push({
-							severity: 'error',
-							path: candidate.absolutePath,
-							message,
-						});
-					}
-					this.dependencies.reportProgress({
-						stage: 'failed',
-						message,
-						current: candidateIndex + 1,
-						total: candidateCount,
-					});
-				}
-				candidateIndex += group.length;
-				if (groupFailed) {
-					break;
-				}
-			}
-
-			if (this.cancelRequested) {
-				const message = `Cancelled after processing ${processedCount.toString()} recording(s).`;
-				const summary = this.makeSummary({
-					startedAt,
-					origin,
-					mode,
-					candidateCount,
-					processedCount,
-					skippedCount,
-					processingFailureCount,
-					scanErrorCount,
-					warningCount,
-					errorCount: processingFailureCount + scanErrorCount,
-					issues,
-					message,
-					status: 'cancelled',
-				});
-				await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
-				this.dependencies.reportProgress({
-					stage: 'cancelled',
-					message,
-				});
-				return { scan, providers, summary };
-			}
-
-			const errorCount = processingFailureCount + scanErrorCount;
-			const message = `Processed ${processedCount.toString()}, already complete ${skippedCount.toString()}, recording failures ${processingFailureCount.toString()}, scan errors ${scanErrorCount.toString()}, timestamp warnings ${warningCount.toString()}.`;
+		if (mode === 'scan-only') {
+			const errorCount = scanErrorCount;
 			const summary = this.makeSummary({
 				startedAt,
 				origin,
@@ -480,19 +388,17 @@ export class PipelineCoordinator {
 				warningCount,
 				errorCount,
 				issues,
-				message,
+				message: `Found ${candidateCount.toString()} recording(s), ${scanErrorCount.toString()} scan error(s), ${warningCount.toString()} timestamp warning(s).`,
 			});
 			await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
 			this.dependencies.reportProgress({
-				stage: errorCount === 0 ? 'complete' : 'failed',
-				message,
-				current: candidateCount,
-				total: candidateCount,
+				stage: scanErrorCount === 0 ? 'complete' : 'failed',
+				message: summary.message,
 			});
-			return { scan, providers, summary };
-		} catch (error) {
-			const fatalError = errorMessage(error);
-			issues.push({ severity: 'error', path: '', message: fatalError });
+			return { scan, summary };
+		}
+		if (scanErrorCount > 0) {
+			const message = `Stopped before processing because ${scanErrorCount.toString()} source scan error${scanErrorCount === 1 ? '' : 's'} occurred.`;
 			const summary = this.makeSummary({
 				startedAt,
 				origin,
@@ -503,23 +409,206 @@ export class PipelineCoordinator {
 				processingFailureCount,
 				scanErrorCount,
 				warningCount,
-				errorCount: Math.max(
-					1,
-					processingFailureCount + scanErrorCount,
-				),
-				message: fatalError,
+				errorCount: scanErrorCount,
 				issues,
+				message,
 				status: 'failed',
 			});
 			await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
 			this.dependencies.reportProgress({
 				stage: 'failed',
-				message: summary.message,
+				message,
 			});
-			throw error;
-		} finally {
-			this.running = false;
+			return { scan, summary };
 		}
+
+		let providers: ProviderHealthReport | undefined;
+		if (candidateCount > 0) {
+			this.dependencies.reportProgress({
+				stage: 'checking-services',
+				message: 'Checking speech-to-text and coding-agent services…',
+			});
+			providers = await this.checkProviders();
+			const unavailable = [
+				providers.stt.ok
+					? undefined
+					: `Speech-to-text service unavailable: ${providers.stt.error ?? 'health check failed'}`,
+				providers.agent.ok
+					? undefined
+					: `Coding agent unavailable: ${providers.agent.error ?? 'health check failed'}`,
+			].filter((message): message is string => message !== undefined);
+			if (unavailable.length > 0) {
+				throw new Error(unavailable.join(' '));
+			}
+		}
+
+		const groups = groupRecordingCandidates(
+			scan.candidates,
+			settings.recordingGrouping,
+		);
+		const statesByFileName = new Map<string, RecordingState[]>();
+		for (const state of Object.values(runtime.recordings)) {
+			const bucket = statesByFileName.get(state.fileName) ?? [];
+			bucket.push(state);
+			statesByFileName.set(state.fileName, bucket);
+		}
+		let candidateIndex = 0;
+		for (const group of groups) {
+			if (this.cancelRequested) {
+				break;
+			}
+			const positions = new Map<AudioCandidate, number>();
+			const inputs = group.map((candidate, groupIndex) => {
+				const position = candidateIndex + groupIndex + 1;
+				positions.set(candidate, position);
+				const decorateProgress = (progress: PipelineProgress): void => {
+					this.dependencies.reportProgress({
+						...progress,
+						current: position,
+						total: candidateCount,
+					});
+				};
+				return {
+					candidate,
+					settings,
+					sttBaseUrl: settings.sttBaseUrl,
+					sttApiKey: settings.sttApiKey,
+					sttRequestFormat:
+						settings.sttProvider === 'openrouter'
+							? ('json-base64' as const)
+							: undefined,
+					splitLongRecordings: settings.sttSplitLongRecordings,
+					ffmpegExecutable: settings.ffmpegExecutable,
+					vaultRoot: this.dependencies.getVaultRoot(),
+					artifactRoot: this.dependencies.getArtifactRoot(),
+					findState: (hash: string) => runtime.recordings[hash],
+					findStateByFingerprint: (target: AudioCandidate) =>
+						statesByFileName
+							.get(target.fileName)
+							?.find(
+								(state) =>
+									state.size === target.size &&
+									state.sourceModifiedAtMs === target.modifiedAtMs,
+							),
+					// Mutates the live state so the fingerprint is persisted by the
+					// end-of-run save instead of writing once per skipped recording.
+					recordFingerprint: (state: RecordingState, target: AudioCandidate) => {
+						state.size = target.size;
+						state.sourceModifiedAtMs = target.modifiedAtMs;
+						state.sourcePath = target.absolutePath;
+						state.fileName = target.fileName;
+					},
+					saveState: async (state: RecordingState) => {
+						runtime.recordings[state.hash] = state;
+						await this.dependencies.saveRuntime(runtime);
+					},
+					reportProgress: decorateProgress,
+					reportActivity: this.dependencies.reportActivity,
+					isCancelled: () => this.cancelRequested,
+				};
+			});
+			let groupFailed = false;
+			try {
+				const outcomes = await this.dependencies.processor.processBatch(inputs);
+				for (const outcome of outcomes) {
+					if (outcome.result === 'skipped') {
+						skippedCount += 1;
+					} else if (outcome.result === 'processed') {
+						processedCount += 1;
+					} else {
+						groupFailed = true;
+						processingFailureCount += 1;
+						const message = errorMessage(outcome.error);
+						issues.push({
+							severity: 'error',
+							path: outcome.candidate.absolutePath,
+							message,
+						});
+						this.dependencies.reportProgress({
+							stage: 'failed',
+							message,
+							fileName: outcome.candidate.fileName,
+							current: positions.get(outcome.candidate),
+							total: candidateCount,
+						});
+					}
+				}
+			} catch (error) {
+				if (this.cancelRequested) {
+					break;
+				}
+				groupFailed = true;
+				const message = errorMessage(error);
+				for (const candidate of group) {
+					processingFailureCount += 1;
+					issues.push({
+						severity: 'error',
+						path: candidate.absolutePath,
+						message,
+					});
+				}
+				this.dependencies.reportProgress({
+					stage: 'failed',
+					message,
+					current: candidateIndex + 1,
+					total: candidateCount,
+				});
+			}
+			candidateIndex += group.length;
+			if (groupFailed) {
+				break;
+			}
+		}
+
+		if (this.cancelRequested) {
+			const message = `Cancelled after processing ${processedCount.toString()} recording(s).`;
+			const summary = this.makeSummary({
+				startedAt,
+				origin,
+				mode,
+				candidateCount,
+				processedCount,
+				skippedCount,
+				processingFailureCount,
+				scanErrorCount,
+				warningCount,
+				errorCount: processingFailureCount + scanErrorCount,
+				issues,
+				message,
+				status: 'cancelled',
+			});
+			await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
+			this.dependencies.reportProgress({
+				stage: 'cancelled',
+				message,
+			});
+			return { scan, providers, summary };
+		}
+
+		const errorCount = processingFailureCount + scanErrorCount;
+		const message = `Processed ${processedCount.toString()}, already complete ${skippedCount.toString()}, recording failures ${processingFailureCount.toString()}, scan errors ${scanErrorCount.toString()}, timestamp warnings ${warningCount.toString()}.`;
+		const summary = this.makeSummary({
+			startedAt,
+			origin,
+			mode,
+			candidateCount,
+			processedCount,
+			skippedCount,
+			processingFailureCount,
+			scanErrorCount,
+			warningCount,
+			errorCount,
+			issues,
+			message,
+		});
+		await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
+		this.dependencies.reportProgress({
+			stage: errorCount === 0 ? 'complete' : 'failed',
+			message,
+			current: candidateCount,
+			total: candidateCount,
+		});
+		return { scan, providers, summary };
 	}
 
 	private makeSummary(input: {

@@ -4,7 +4,7 @@ export type StartupMode = 'off' | 'scan-only' | 'scan-and-process';
 export type CodingAgentType = 'pi' | 'claude' | 'codex' | 'cursor';
 export type SttProviderType = 'custom' | 'openrouter';
 export type PipelineMode = 'scan-only' | 'scan-and-process';
-export type RunOrigin = 'command' | 'ribbon' | 'startup';
+export type RunOrigin = 'command' | 'ribbon' | 'startup' | 'manual';
 export type RecordingTimestampSource = 'filename' | 'filesystem';
 export type RecordingGrouping = 'none' | 'day' | 'week' | 'month' | 'all';
 

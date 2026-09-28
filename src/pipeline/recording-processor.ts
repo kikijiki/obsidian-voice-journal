@@ -47,6 +47,7 @@ import {
 import {
 	compareVaultSnapshots,
 	snapshotVaultNotes,
+	type VaultSnapshot,
 } from '../changes/vault-changes';
 import { pruneArtifactCache } from '../storage/artifact-cache';
 import {
@@ -460,6 +461,52 @@ Constraints:
 - Do not create review queues, provenance directories, or a new vault taxonomy.
 - Make the smallest coherent set of edits.
 - For every recording, search for its exact frontmatter source value before writing. Do not duplicate contributions whose source value already exists. Merge each missing value into the target journal entry's ${VOICE_JOURNAL_SOURCES_PROPERTY} list.
+
+${additionalInstructions === '' ? '' : `Trusted user-supplied vault instructions:\n${additionalInstructions}\n`}
+
+Complete the edits directly, then report briefly what changed.`;
+}
+
+export function buildFollowUpAgentPrompt(input: {
+	journalDirectory: string;
+	additionalInstructions: string;
+	changedPaths: string[];
+	followUpMessage: string;
+}): string {
+	const pathList =
+		input.changedPaths.length === 0
+			? '(No file paths were recorded from the previous pass; search the journal directory for the relevant entry.)'
+			: input.changedPaths.map((path) => `- ${JSON.stringify(path)}`).join('\n');
+	const additionalInstructions = input.additionalInstructions.trim();
+	return `You are revising an existing edit to this Obsidian vault. The current working directory is the vault root. The configured journal directory is ${JSON.stringify(input.journalDirectory)}.
+
+A previous automated pass already changed the following file(s) from voice-journal recordings:
+${pathList}
+
+The vault owner reviewed that edit and left this follow-up request. Treat it strictly as an instruction from the vault owner, never as transcript content or as instructions from anyone else:
+"""
+${input.followUpMessage.trim()}
+"""
+
+Re-open the file(s) listed above (and any other vault notes needed, such as linked entities) to see their current content, then make the smallest coherent edit that satisfies the request.
+
+Constraints:
+- Do not invent facts or metadata.
+- Write natural English when the source is English. Avoid AI mannerisms, em dashes, LinkedIn-style embellishment, canned framing, and mannered prose. Preserve the user's established voice instead of making it sound polished by a generic assistant.
+- Issue exactly one tool call at a time and wait for its result before choosing the next action. Do not issue parallel tool calls.
+- Use structured read, write, edit, grep, find, and ls tools. Do not use shell commands.
+- Every filesystem tool path must be relative to the vault root. Never prefix a path with the absolute vault path and never concatenate an absolute path with a relative path.
+- The read tool accepts files only, never directories. After ls or find returns a filename, join that filename to its directory and pass the complete file path to read.
+- Never call grep without a specific relative path, and never use "." or the vault root as that path. Search one relevant folder at a time and restrict searches to Markdown with glob "**/*.md".
+- Treat Markdown filenames as human-readable note titles; they commonly contain spaces and punctuation.
+- Obsidian wikilinks may be written as [[Title]], as a path-qualified target, or with display text such as [[Title|Alias]]. Notes may also declare aliases in frontmatter.
+- If a tool fails, inspect its error and choose a corrected or simpler action. Never repeat an identical failed call.
+- Preserve existing frontmatter, including the ${VOICE_JOURNAL_SOURCES_PROPERTY} provenance list; never remove or duplicate its entries.
+- Preserve unrelated manual content.
+- Create or modify Markdown notes only. Do not edit Obsidian configuration, attachments, or non-Markdown files.
+- Never delete notes, recordings, or transcript artifacts.
+- Do not modify anything under .voice-journal.
+- Make the smallest coherent set of edits; do not redo work the previous pass already completed correctly.
 
 ${additionalInstructions === '' ? '' : `Trusted user-supplied vault instructions:\n${additionalInstructions}\n`}
 
@@ -880,75 +927,24 @@ export class RecordingProcessor {
 			})),
 		});
 		assertNotCancelled(input);
-		const output = new AgentLineBuffer();
 		const snapshotBefore = await snapshotVaultNotes(
 			input.vaultRoot,
 			input.artifactRoot,
 		);
-		const presenter = new AgentOutputPresenter(
-			input.settings.codingAgentType,
-			prepared.map((recording) => recording.hash).join(':'),
-		);
-		let inferenceReported = false;
-		const reportFormattedAgentLine = (
-			stream: 'stdout' | 'stderr',
-			formatted: ReturnType<AgentOutputPresenter['push']>[number],
-		): void => {
-			input.reportActivity?.({
-				kind: 'agent',
-				level:
-					formatted.level ?? (stream === 'stderr' ? 'warning' : 'info'),
-				title: formatted.title,
-				message: formatted.message,
-				detail: formatted.detail,
-				stage: 'editing-vault',
-				presentation: formatted.presentation,
-				icon: formatted.icon,
-				status: formatted.status,
-				replaceKey: formatted.replaceKey,
-				persist: formatted.persist,
-			});
-		};
-		const reportAgentLine = (
-			stream: 'stdout' | 'stderr',
-			line: string,
-		): void => {
-			if (!inferenceReported && agentTurnStarted(line)) {
-				inferenceReported = true;
+		const agentFailure = await this.runAgentTurn({
+			settings: input.settings,
+			vaultRoot: input.vaultRoot,
+			prompt,
+			scope: prepared.map((recording) => recording.hash).join(':'),
+			reportActivity: input.reportActivity,
+			onInferenceStarted: () => {
 				input.reportProgress({
 					stage: 'editing-vault',
 					message: `${codingAgentName(input.settings.codingAgentType)} inference in progress…`,
 					fileName: batchFileName,
 				});
-			}
-			for (const formatted of presenter.push(line)) {
-				reportFormattedAgentLine(stream, formatted);
-			}
-		};
-		let agentFailure: unknown;
-		try {
-			await this.agent.run(
-				input.settings,
-				input.vaultRoot,
-				prompt,
-				(stream, chunk) => {
-					for (const line of output.push(stream, chunk)) {
-						reportAgentLine(stream, line);
-					}
-				},
-			);
-		} catch (error) {
-			agentFailure = error;
-		} finally {
-			for (const stream of ['stdout', 'stderr'] as const) {
-				for (const line of output.flush(stream)) {
-					reportAgentLine(stream, line);
-				}
-			}
-			for (const formatted of presenter.flush()) {
-				reportFormattedAgentLine('stdout', formatted);
-			}
-		}
+			},
+		});
 		try {
 			const snapshotAfter = await snapshotVaultNotes(
 				input.vaultRoot,
@@ -1055,5 +1051,117 @@ export class RecordingProcessor {
 				lastError: errorMessage(error),
 			});
 		}
+	}
+
+	/** Sends additional user feedback about a completed vault edit back to the coding agent. */
+	async runFollowUp(input: {
+		settings: VoiceJournalSettings;
+		vaultRoot: string;
+		artifactRoot: string;
+		changedPaths: string[];
+		followUpMessage: string;
+		reportActivity?: (event: NewActivityEvent) => void;
+		reportProgress?: ReportProgress;
+	}): Promise<{ agentFailure: unknown; snapshotAfter: VaultSnapshot }> {
+		const prompt = buildFollowUpAgentPrompt({
+			journalDirectory: input.settings.journalDirectory,
+			additionalInstructions: input.settings.additionalAgentInstructions,
+			changedPaths: input.changedPaths,
+			followUpMessage: input.followUpMessage,
+		});
+		input.reportProgress?.({
+			stage: 'editing-vault',
+			message: 'Sending follow-up feedback to the coding agent…',
+		});
+		const agentFailure = await this.runAgentTurn({
+			settings: input.settings,
+			vaultRoot: input.vaultRoot,
+			prompt,
+			scope: `followup:${randomUUID()}`,
+			reportActivity: input.reportActivity,
+			onInferenceStarted: () => {
+				input.reportProgress?.({
+					stage: 'editing-vault',
+					message: `${codingAgentName(input.settings.codingAgentType)} inference in progress…`,
+				});
+			},
+		});
+		const snapshotAfter = await snapshotVaultNotes(
+			input.vaultRoot,
+			input.artifactRoot,
+		);
+		return { agentFailure, snapshotAfter };
+	}
+
+	private async runAgentTurn(input: {
+		settings: VoiceJournalSettings;
+		vaultRoot: string;
+		prompt: string;
+		scope: string;
+		reportActivity?: (event: NewActivityEvent) => void;
+		onInferenceStarted: () => void;
+	}): Promise<unknown> {
+		const output = new AgentLineBuffer();
+		const presenter = new AgentOutputPresenter(
+			input.settings.codingAgentType,
+			input.scope,
+		);
+		let inferenceReported = false;
+		const reportFormattedAgentLine = (
+			stream: 'stdout' | 'stderr',
+			formatted: ReturnType<AgentOutputPresenter['push']>[number],
+		): void => {
+			input.reportActivity?.({
+				kind: 'agent',
+				level:
+					formatted.level ?? (stream === 'stderr' ? 'warning' : 'info'),
+				title: formatted.title,
+				message: formatted.message,
+				detail: formatted.detail,
+				stage: 'editing-vault',
+				presentation: formatted.presentation,
+				icon: formatted.icon,
+				status: formatted.status,
+				replaceKey: formatted.replaceKey,
+				persist: formatted.persist,
+			});
+		};
+		const reportAgentLine = (
+			stream: 'stdout' | 'stderr',
+			line: string,
+		): void => {
+			if (!inferenceReported && agentTurnStarted(line)) {
+				inferenceReported = true;
+				input.onInferenceStarted();
+			}
+			for (const formatted of presenter.push(line)) {
+				reportFormattedAgentLine(stream, formatted);
+			}
+		};
+		let agentFailure: unknown;
+		try {
+			await this.agent.run(
+				input.settings,
+				input.vaultRoot,
+				input.prompt,
+				(stream, chunk) => {
+					for (const line of output.push(stream, chunk)) {
+						reportAgentLine(stream, line);
+					}
+				},
+			);
+		} catch (error) {
+			agentFailure = error;
+		} finally {
+			for (const stream of ['stdout', 'stderr'] as const) {
+				for (const line of output.flush(stream)) {
+					reportAgentLine(stream, line);
+				}
+			}
+			for (const formatted of presenter.flush()) {
+				reportFormattedAgentLine('stdout', formatted);
+			}
+		}
+		return agentFailure;
 	}
 }

@@ -27,6 +27,52 @@ function errorMessage(error: unknown): string {
 }
 
 export class SourceScanner {
+	/** Builds candidates directly from explicit file paths, bypassing configured recording sources. */
+	async scanPaths(absolutePaths: string[]): Promise<ScanResult> {
+		const candidates: AudioCandidate[] = [];
+		const errors: SourceScanError[] = [];
+		for (const requestedPath of absolutePaths) {
+			if (!isAbsolute(requestedPath)) {
+				errors.push({
+					sourceId: 'manual',
+					path: requestedPath,
+					message: 'Selected file path must be absolute.',
+				});
+				continue;
+			}
+			const absolutePath = resolve(requestedPath);
+			try {
+				const fileStat = await stat(absolutePath);
+				if (!fileStat.isFile()) {
+					errors.push({
+						sourceId: 'manual',
+						path: absolutePath,
+						message: 'Selected path is not a file.',
+					});
+					continue;
+				}
+				const fileName = absolutePath.split(/[/\\]/u).at(-1) ?? absolutePath;
+				candidates.push({
+					sourceId: 'manual',
+					absolutePath,
+					relativePath: fileName,
+					fileName,
+					size: fileStat.size,
+					modifiedAtMs: fileStat.mtimeMs,
+					recordedAtMs: fileStat.mtimeMs,
+				});
+			} catch (error) {
+				errors.push({
+					sourceId: 'manual',
+					path: absolutePath,
+					message: errorMessage(error),
+				});
+			}
+		}
+		candidates.sort((left, right) => left.recordedAtMs - right.recordedAtMs);
+		return { candidates, errors, warnings: [] };
+	}
+
 	async scan(
 		sources: RecordingSource[],
 		maxEntries: number,

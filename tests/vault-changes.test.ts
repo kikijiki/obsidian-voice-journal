@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
 	classifyDiffLine,
 	compareVaultSnapshots,
+	effectiveBaselineSnapshot,
 	revertVaultFileChange,
 	snapshotVaultNotes,
 } from '../src/changes/vault-changes';
@@ -67,5 +68,41 @@ describe('vault change reports', () => {
 		await expect(revertVaultFileChange(vault, change)).rejects.toThrow(
 			/changed after the agent run/u,
 		);
+	});
+
+	it('reconstructs the true original snapshot for a follow-up diff', () => {
+		// The first pass created "new.md" and modified "existing.md"; a
+		// follow-up run then further edits "existing.md" and touches an
+		// untouched file "other.md" for the first time.
+		const priorChanges = compareVaultSnapshots(
+			new Map([['existing.md', 'original\n']]),
+			new Map([
+				['existing.md', 'first pass\n'],
+				['new.md', 'created\n'],
+			]),
+		);
+		const currentSnapshot = new Map([
+			['existing.md', 'first pass\n'],
+			['new.md', 'created\n'],
+			['other.md', 'never touched\n'],
+		]);
+
+		const baseline = effectiveBaselineSnapshot(currentSnapshot, priorChanges);
+
+		expect(baseline.get('existing.md')).toBe('original\n');
+		expect(baseline.has('new.md')).toBe(false);
+		expect(baseline.get('other.md')).toBe('never touched\n');
+
+		const afterFollowUp = new Map([
+			['existing.md', 'second pass\n'],
+			['new.md', 'created\n'],
+			['other.md', 'now touched\n'],
+		]);
+		const cumulative = compareVaultSnapshots(baseline, afterFollowUp);
+		expect(cumulative).toEqual([
+			expect.objectContaining({ path: 'existing.md', kind: 'modified' }),
+			expect.objectContaining({ path: 'new.md', kind: 'created' }),
+			expect.objectContaining({ path: 'other.md', kind: 'modified' }),
+		]);
 	});
 });
