@@ -376,12 +376,14 @@ export class CodingAgentClient {
 
 	cancelActiveRun(): boolean {
 		const child = this.activeChild;
-		if (child === null) {
+		// Once the child has exited there is nothing left to interrupt: any
+		// lingering grandchild still holding the output pipe open is already
+		// reaped by runProcess()'s own exit-grace timer, independent of this.
+		// Marking cancelRequested here would instead retroactively discard an
+		// agent run that may have already completed successfully.
+		if (child === null || !this.isAlive(child)) {
 			return false;
 		}
-		// The run stays active until its output has drained, which can
-		// outlast the agent process itself, so a cancel is still honoured
-		// after the child has exited.
 		this.cancelRequested = true;
 		this.terminateChild(child);
 		return true;

@@ -281,4 +281,48 @@ describe('SourceScanner.scanPaths', () => {
 			recordedAtMs: new Date(2026, 8, 21, 20, 4, 43).valueOf(),
 		});
 	});
+
+	it('picks the most specific of two nested sources for a manual pick', async () => {
+		const root = await createFixtureRoot();
+		const nested = join(root, 'phone');
+		await mkdir(nested, { recursive: true });
+		const recording = join(nested, 'REC_20260921_190443.wav');
+		await writeFile(recording, 'audio');
+
+		const result = await new SourceScanner().scanPaths(
+			[recording],
+			[
+				{
+					id: 'broad',
+					name: 'Broad mount',
+					path: root,
+					recursive: true,
+					extensions: ['.wav'],
+					minimumAgeSeconds: 0,
+					timestampSource: 'filesystem',
+					filenameTimestampRegex: DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX,
+					timestampOffsetHours: 0,
+				},
+				{
+					id: 'phone',
+					name: 'Phone subfolder',
+					path: nested,
+					recursive: true,
+					extensions: ['.wav'],
+					minimumAgeSeconds: 0,
+					timestampSource: 'filename',
+					filenameTimestampRegex:
+						'^REC_(?<year>\\d{4})(?<month>\\d{2})(?<day>\\d{2})_(?<hour>\\d{2})(?<minute>\\d{2})(?<second>\\d{2})\\.[^.]+$',
+					timestampOffsetHours: 0,
+				},
+			],
+		);
+
+		// The broad source is listed first but the phone subfolder is more
+		// specific and has the regex that actually matches this filename.
+		expect(result.candidates[0]).toMatchObject({
+			sourceId: 'phone',
+			recordedAtMs: new Date(2026, 8, 21, 19, 4, 43).valueOf(),
+		});
+	});
 });

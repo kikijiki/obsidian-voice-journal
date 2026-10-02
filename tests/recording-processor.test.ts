@@ -12,6 +12,7 @@ import type {
 import type { NewActivityEvent } from '../src/activity/log';
 import {
 	buildJournalAgentPrompt,
+	combineTranscriptionResults,
 	RecordingProcessor,
 } from '../src/pipeline/recording-processor';
 import { DEFAULT_SETTINGS } from '../src/settings/model';
@@ -519,6 +520,48 @@ describe('RecordingProcessor', () => {
 		await expect(stat(chunkDir)).rejects.toThrow();
 	});
 
+	it('offsets later segments by each chunk\'s real probed duration, not the uniform plan', () => {
+		// A plain `json`-format response omits duration. ffmpeg's segment
+		// muxer cuts on packet/keyframe boundaries rather than exact seconds,
+		// so the first chunk's real length (200s, probed) differs from the
+		// uniform planned length (300s) that was previously used as the
+		// stand-in for every chunk regardless of its actual length.
+		const combined = combineTranscriptionResults(
+			[
+				{
+					text: 'First.',
+					segments: [{ id: 'a', start: 0, end: 1, text: 'first' }],
+					rawResponse: {},
+				},
+				{
+					text: 'Second.',
+					segments: [{ id: 'b', start: 0, end: 1, text: 'second' }],
+					rawResponse: {},
+				},
+			],
+			[200, 90],
+			300,
+		);
+		expect(combined.segments[1]?.start).toBe(200);
+		expect(combined.duration).toBe(290);
+	});
+
+	it('falls back to the planned length only when a chunk could not be probed', () => {
+		const combined = combineTranscriptionResults(
+			[
+				{ text: 'First.', segments: [], rawResponse: {} },
+				{
+					text: 'Second.',
+					segments: [{ id: 'b', start: 0, end: 1, text: 'second' }],
+					rawResponse: {},
+				},
+			],
+			[null, 90],
+			300,
+		);
+		expect(combined.segments[0]?.start).toBe(300);
+	});
+
 	it('skips stability and hashing when a recorded fingerprint matches', async () => {
 		const input = await fixture();
 		const fakeHash = 'a'.repeat(64);
@@ -845,6 +888,92 @@ describe('RecordingProcessor', () => {
 		}
 	});
 
+	it('does not charge a successful run against the attempt budget', async () => {
+		const input = await fixture();
+		const states: Record<string, RecordingState> = {};
+		let transcribeCalls = 0;
+		const processor = new RecordingProcessor(
+			{
+				transcribe: async () => {
+					transcribeCalls += 1;
+					if (transcribeCalls === 1) {
+						throw new Error('Gateway timeout.');
+					}
+					return {
+						text: 'Second attempt succeeds.',
+						segments: [],
+						rawResponse: { text: 'Second attempt succeeds.' },
+					};
+				},
+			},
+			{
+				run: async (_settings, vaultPath: string) => {
+					await mkdir(join(vaultPath, 'Journal'), { recursive: true });
+					await writeFile(join(vaultPath, 'Journal', 'entry.md'), 'Entry.\n');
+					return { stdout: '', stderr: '' };
+				},
+			},
+			0,
+		);
+		const process = async () =>
+			await processor.process({
+				...input,
+				sttBaseUrl: 'http://localhost:8001/v1',
+				findState: (hash) => states[hash],
+				saveState: async (state) => {
+					states[state.hash] = state;
+				},
+				reportProgress: () => undefined,
+			});
+
+		await expect(process()).rejects.toThrow(/Gateway timeout/u);
+		expect(Object.values(states)[0]).toMatchObject({ attempts: 1, stage: 'copied' });
+
+		expect(await process()).toBe('processed');
+		// A run that progresses the recording to completion without any new
+		// error must not itself count as another attempt.
+		expect(Object.values(states)[0]).toMatchObject({ attempts: 1, stage: 'complete' });
+	});
+
+	it('does not permanently fail a recording whose scan-time size was stale', async () => {
+		const input = await fixture();
+		// Simulate a file the scanner saw as an empty placeholder, which has
+		// since been filled with real audio by the time prepare() runs.
+		await writeFile(input.candidate.absolutePath, 'now has real audio');
+		const staleCandidate: AudioCandidate = { ...input.candidate, size: 0 };
+		const states: Record<string, RecordingState> = {};
+		const processor = new RecordingProcessor(
+			{
+				transcribe: async () => ({
+					text: 'Transcribed.',
+					segments: [],
+					rawResponse: { text: 'Transcribed.' },
+				}),
+			},
+			{
+				run: async (_settings, vaultPath: string) => {
+					await mkdir(join(vaultPath, 'Journal'), { recursive: true });
+					await writeFile(join(vaultPath, 'Journal', 'entry.md'), 'Entry.\n');
+					return { stdout: '', stderr: '' };
+				},
+			},
+			0,
+		);
+
+		await expect(
+			processor.process({
+				...input,
+				candidate: staleCandidate,
+				sttBaseUrl: 'http://localhost:8001/v1',
+				findState: (hash) => states[hash],
+				saveState: async (state) => {
+					states[state.hash] = state;
+				},
+				reportProgress: () => undefined,
+			}),
+		).resolves.toBe('processed');
+	});
+
 	it('warns the agent when a previous run for the recording was interrupted', async () => {
 		const input = await fixture();
 		const states: Record<string, RecordingState> = {};
@@ -877,22 +1006,33 @@ describe('RecordingProcessor', () => {
 		expect(Object.values(states)[0]?.agentStartedAt).toBeDefined();
 
 		const run = vi.fn(
-			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
-				stdout: '',
-				stderr: '',
-			}),
+			async (_settings: VoiceJournalSettings, vaultPath: string, _prompt: string) => {
+				await mkdir(join(vaultPath, 'Journal'), { recursive: true });
+				await writeFile(join(vaultPath, 'Journal', 'entry.md'), 'Went hiking.\n');
+				return { stdout: '', stderr: '' };
+			},
 		);
+		const activity: NewActivityEvent[] = [];
 		await new RecordingProcessor({ transcribe }, { run }, 0).process({
 			...input,
 			sttBaseUrl: 'http://localhost:8001/v1',
 			findState: (hash) => states[hash],
 			saveState: save,
 			reportProgress: () => undefined,
+			reportActivity: (event) => activity.push(event),
 		});
 		expect(run.mock.calls[0]?.[2]).toContain(
 			'A previous attempt to process this recording was interrupted',
 		);
 		expect(Object.values(states)[0]?.agentStartedAt).toBeUndefined();
+		// With no deterministic duplicate-content check, the diff is flagged
+		// for the user to look at instead.
+		expect(activity).toContainEqual(
+			expect.objectContaining({
+				level: 'warning',
+				title: 'Resumed run — check for duplicate content',
+			}),
+		);
 	});
 
 	it('allows Pi to recover from consecutive tool failures', async () => {

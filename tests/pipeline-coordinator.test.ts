@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type {
 	AudioCandidate,
 	PipelineProgress,
+	RecordingGrouping,
 	RecordingState,
 	RuntimeState,
 } from '../src/model';
@@ -441,12 +442,13 @@ describe('PipelineCoordinator', () => {
 			}>
 		>;
 		checkHealth?: () => Promise<{ baseUrl: string; ok: boolean; latencyMs: number; models: string[]; error?: string }>;
+		recordingGrouping?: RecordingGrouping;
 	}): PipelineCoordinator {
 		const runtime = input.runtime ?? { lastRun: null, recordings: {} };
 		return new PipelineCoordinator({
 			getSettings: () => ({
 				...structuredClone(DEFAULT_SETTINGS),
-				recordingGrouping: 'none',
+				recordingGrouping: input.recordingGrouping ?? 'none',
 			}),
 			getRuntime: () => runtime,
 			getVaultRoot: () => '/vault',
@@ -545,6 +547,64 @@ describe('PipelineCoordinator', () => {
 		expect(processBatch).toHaveBeenCalledTimes(3);
 		expect(result.summary.processingFailureCount).toBe(3);
 		expect(result.summary.issues.at(-1)?.message).toContain('consecutive failed groups');
+	});
+
+	it('trips the breaker on a degraded dependency that fails most, not all, of each group', async () => {
+		// Day grouping with four recordings per day gives three distinct
+		// groups in one run, each with a 3-out-of-4 (75%) failure rate: never
+		// 100%, which the old "every outcome failed" rule would have missed.
+		const dayMs = (dayIndex: number) => Date.UTC(2026, 0, dayIndex + 1, 12, 0, 0);
+		const candidates = [0, 1, 2].flatMap((day) =>
+			['a', 'b', 'c', 'd'].map((letter) => ({
+				...candidate(`day${day.toString()}-${letter}.wav`),
+				recordedAtMs: dayMs(day),
+			})),
+		);
+		const processBatch = vi.fn(async (inputs: ProcessRecordingInput[]) =>
+			inputs.map((input, index) => ({
+				candidate: input.candidate,
+				...(index < 3
+					? { result: 'failed' as const, error: new Error('STT is degraded.') }
+					: { result: 'processed' as const }),
+			})),
+		);
+		const result = await testCoordinator({
+			candidates,
+			processBatch,
+			recordingGrouping: 'day',
+		}).run('scan-and-process', 'command');
+
+		expect(processBatch).toHaveBeenCalledTimes(3);
+		expect(result.summary.issues.at(-1)?.message).toContain('consecutive failed groups');
+	});
+
+	it('does not trip the breaker over one persistently bad file in a larger group', async () => {
+		const processBatch = vi.fn(async (inputs: ProcessRecordingInput[]) =>
+			inputs.map((input) =>
+				input.candidate.fileName === 'bad.wav'
+					? {
+							candidate: input.candidate,
+							result: 'failed' as const,
+							error: new Error('Corrupt audio.'),
+						}
+					: { candidate: input.candidate, result: 'processed' as const },
+			),
+		);
+		const result = await testCoordinator({
+			candidates: ['bad', 'b', 'c', 'd', 'e'].map((name) => candidate(`${name}.wav`)),
+			processBatch,
+			recordingGrouping: 'all',
+		}).run('scan-and-process', 'command');
+
+		// The one bad file is a reported failure, but it alone must not stop
+		// the run from processing the four good recordings alongside it.
+		expect(result.summary.processedCount).toBe(4);
+		expect(result.summary.processingFailureCount).toBe(1);
+		expect(
+			result.summary.issues.some((issue) =>
+				issue.message.includes('consecutive failed groups'),
+			),
+		).toBe(false);
 	});
 
 	it('resumes unfinished recordings whose source is gone', async () => {

@@ -54,6 +54,7 @@ import {
 	type AudioSplitter,
 } from '../audio/ffmpeg';
 import { planChunkSeconds, STT_MAX_CHUNK_BYTES } from '../audio/chunking';
+import { isPathInside } from '../util/path-containment';
 
 interface TranscriptionProvider {
 	transcribe(
@@ -124,16 +125,25 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown processing error.';
 }
 
+/**
+ * The attempts value to persist alongside a failure: cancelling never counts
+ * as an attempt (the recording wasn't actually given a chance to fail), so
+ * only a real error advances the budget `failureStage` checks below.
+ */
+function nextAttempts(input: ProcessRecordingInput, state: RecordingState): number {
+	return input.isCancelled?.() === true ? state.attempts : state.attempts + 1;
+}
+
 function failureStage(
 	input: ProcessRecordingInput,
 	state: RecordingState,
+	attempts: number,
 	error: unknown,
 ): RecordingState['stage'] {
 	if (input.isCancelled?.() === true) {
 		return state.stage;
 	}
-	return error instanceof PermanentRecordingError ||
-		state.attempts >= MAX_RECORDING_ATTEMPTS
+	return error instanceof PermanentRecordingError || attempts >= MAX_RECORDING_ATTEMPTS
 		? 'failed'
 		: state.stage;
 }
@@ -185,8 +195,11 @@ function audioContentType(path: string): string {
 	}
 }
 
-function combineTranscriptionResults(
+export function combineTranscriptionResults(
 	results: TranscriptionResult[],
+	// Each chunk's real length, probed after splitting (null if that probe
+	// failed), aligned by index with `results`.
+	actualChunkSeconds: Array<number | null>,
 	plannedChunkSeconds: number,
 ): TranscriptionResult {
 	if (results.length === 1 && results[0] !== undefined) {
@@ -195,7 +208,7 @@ function combineTranscriptionResults(
 	let offsetSeconds = 0;
 	let segmentIndex = 0;
 	const segments: TranscriptSegment[] = [];
-	for (const result of results) {
+	for (const [index, result] of results.entries()) {
 		for (const segment of result.segments) {
 			segmentIndex += 1;
 			segments.push({
@@ -206,9 +219,11 @@ function combineTranscriptionResults(
 				text: segment.text,
 			});
 		}
-		// Plain `json` responses omit the duration; the planned split length
-		// keeps later parts' segment times from restarting at zero.
-		offsetSeconds += result.duration ?? plannedChunkSeconds;
+		// Plain `json` responses omit the duration. ffmpeg's segment muxer
+		// cuts on packet/keyframe boundaries, not exact seconds, so each
+		// chunk's probed real length is a closer stand-in than the uniform
+		// planned length (which is a fallback of last resort).
+		offsetSeconds += result.duration ?? actualChunkSeconds[index] ?? plannedChunkSeconds;
 	}
 	return {
 		text: results
@@ -276,7 +291,7 @@ function restoreArtifactPath(
 		return fallback;
 	}
 	const restored = resolve(vaultRoot, storedPath);
-	if (!restored.startsWith(`${artifactRoot}${sep}`)) {
+	if (!isPathInside(artifactRoot, restored)) {
 		return fallback;
 	}
 	return restored;
@@ -652,8 +667,12 @@ export class RecordingProcessor {
 			size: candidate.size,
 			sourceModifiedAtMs: candidate.modifiedAtMs,
 			recordedAtMs: candidate.recordedAtMs,
+			// `attempts` only advances when a real failure is recorded (in the
+			// catch block below, or in saveBatchFailure); a recording that
+			// simply needs several ordinary runs to progress through its
+			// stages must not be charged for runs where nothing went wrong.
 			// A manual retry of a failed recording gets a fresh attempt budget.
-			attempts: (state.stage === 'failed' ? 0 : state.attempts) + 1,
+			attempts: state.stage === 'failed' ? 0 : state.attempts,
 			updatedAt: new Date().toISOString(),
 			lastError: undefined,
 		};
@@ -696,7 +715,12 @@ export class RecordingProcessor {
 		await input.saveState(state);
 
 		try {
-			if (candidate.size === 0) {
+			// `candidate.size` is from the source scan and can be stale by the
+			// time this runs (a placeholder file that was empty when scanned
+			// may have real audio by now); assertStable already re-stats when
+			// it runs, but the fingerprint-match fast path above skips that,
+			// so check fresh here regardless of which path was taken.
+			if ((await stat(candidate.absolutePath)).size === 0) {
 				throw new PermanentRecordingError('Recording is empty.');
 			}
 			if (state.stage === 'discovered') {
@@ -770,9 +794,11 @@ export class RecordingProcessor {
 				resumed: state.agentStartedAt !== undefined,
 			};
 		} catch (error) {
+			const attempts = nextAttempts(input, state);
 			await input.saveState({
 				...state,
-				stage: failureStage(input, state, error),
+				attempts,
+				stage: failureStage(input, state, attempts, error),
 				updatedAt: new Date().toISOString(),
 				lastError: errorMessage(error),
 			});
@@ -861,7 +887,19 @@ export class RecordingProcessor {
 						: `${stem}.part${part}${extname(chunkPath)}`;
 				results.push(await this.transcribeFile(input, chunkPath, uploadFileName));
 			}
-			return combineTranscriptionResults(results, chunkSeconds);
+			const actualChunkSeconds = await Promise.all(
+				chunkPaths.map(async (chunkPath) => {
+					try {
+						return await this.audioSplitter.probeDurationSeconds(
+							chunkPath,
+							ffmpegExecutable,
+						);
+					} catch {
+						return null;
+					}
+				}),
+			);
+			return combineTranscriptionResults(results, actualChunkSeconds, chunkSeconds);
 		} finally {
 			await rm(chunkDir, { recursive: true, force: true }).catch(() => undefined);
 		}
@@ -888,6 +926,7 @@ export class RecordingProcessor {
 			model: input.settings.sttModel,
 			apiKey: input.sttApiKey ?? '',
 			requestFormat: input.sttRequestFormat,
+			isCancelled: input.isCancelled,
 		});
 	}
 
@@ -970,6 +1009,20 @@ export class RecordingProcessor {
 					stage: 'editing-vault',
 					persist: false,
 				});
+				if (prepared.some((recording) => recording.resumed)) {
+					// There is no deterministic way to confirm the agent didn't
+					// duplicate content from the interrupted attempt (provenance
+					// lives in plugin state now, not a frontmatter marker it could
+					// search for), so flag this diff for a closer look instead of
+					// treating it as an ordinary successful run.
+					input.reportActivity?.({
+						kind: 'pipeline',
+						level: 'warning',
+						title: 'Resumed run — check for duplicate content',
+						message: `${batchLabel} resumed after an earlier run was interrupted. Review this change report for content the interrupted attempt may have already added before accepting it.`,
+						stage: 'editing-vault',
+					});
+				}
 			}
 		} catch (error) {
 			input.reportActivity?.({
@@ -1031,9 +1084,11 @@ export class RecordingProcessor {
 		error: unknown,
 	): Promise<void> {
 		for (const recording of prepared) {
+			const attempts = nextAttempts(recording.input, recording.state);
 			await recording.input.saveState({
 				...recording.state,
-				stage: failureStage(recording.input, recording.state, error),
+				attempts,
+				stage: failureStage(recording.input, recording.state, attempts, error),
 				updatedAt: new Date().toISOString(),
 				lastError: errorMessage(error),
 			});

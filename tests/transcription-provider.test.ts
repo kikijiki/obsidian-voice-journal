@@ -229,4 +229,28 @@ describe('OpenAiTranscriptionProvider', () => {
 		expect(result.text).toBe('hello');
 		expect(calls).toBe(3);
 	});
+
+	it('stops retrying once cancellation is detected instead of waiting out the backoff', async () => {
+		let calls = 0;
+		const provider = new OpenAiTranscriptionProvider(
+			async () => {
+				calls += 1;
+				return response(503, { error: { message: 'unavailable' } });
+			},
+			600_000,
+			[0, 0],
+		);
+		await expect(
+			provider.transcribe('http://127.0.0.1:8001/v1', {
+				audio: new ArrayBuffer(0),
+				fileName: 'voice.wav',
+				contentType: 'audio/wav',
+				model: '',
+				isCancelled: () => true,
+			}),
+		).rejects.toThrow(/cancelled/u);
+		// The first attempt still happens (requestUrl can't be aborted
+		// mid-flight), but no retry is attempted once cancelled.
+		expect(calls).toBe(1);
+	});
 });

@@ -1,17 +1,8 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
+import { isPathInside } from '../util/path-containment';
 
 const CACHE_GITIGNORE = '*\n';
-
-function isInside(parent: string, candidate: string): boolean {
-	const path = relative(parent, candidate);
-	return (
-		path !== '' &&
-		path !== '..' &&
-		!path.startsWith(`..${sep}`) &&
-		!isAbsolute(path)
-	);
-}
 
 export function resolvePluginArtifactRoot(
 	vaultRoot: string,
@@ -35,7 +26,7 @@ export function resolvePluginArtifactRoot(
 		pluginId,
 		'.voice-journal',
 	);
-	if (!isInside(root, artifactRoot)) {
+	if (!isPathInside(root, artifactRoot)) {
 		throw new Error('Plugin storage must remain inside the active vault.');
 	}
 	return artifactRoot;

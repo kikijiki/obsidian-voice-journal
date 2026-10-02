@@ -1,6 +1,6 @@
 import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { extname, isAbsolute, relative, resolve } from 'node:path';
 import type {
 	AudioCandidate,
 	RecordingSource,
@@ -12,6 +12,7 @@ import {
 	compileFilenameTimestampRegex,
 	resolveRecordingTimestamp,
 } from './recording-timestamp';
+import { isPathInside } from '../util/path-containment';
 
 function normalizeExtensions(extensions: string[]): Set<string> {
 	return new Set(
@@ -26,15 +27,31 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown filesystem error.';
 }
 
+/**
+ * The configured source whose directory most specifically contains the
+ * path: when sources are nested (e.g. a broad mount point and a more
+ * specific subfolder within it, each with their own timestamp rules), the
+ * longest matching root wins rather than whichever happens to be listed
+ * first.
+ */
 function containingSource(
 	sources: RecordingSource[],
 	absolutePath: string,
 ): RecordingSource | undefined {
-	return sources.find(
-		(source) =>
-			isAbsolute(source.path) &&
-			absolutePath.startsWith(`${resolve(source.path)}${sep}`),
-	);
+	let best: { source: RecordingSource; root: string } | undefined;
+	for (const source of sources) {
+		if (!isAbsolute(source.path)) {
+			continue;
+		}
+		const root = resolve(source.path);
+		if (!isPathInside(root, absolutePath)) {
+			continue;
+		}
+		if (best === undefined || root.length > best.root.length) {
+			best = { source, root };
+		}
+	}
+	return best?.source;
 }
 
 export class SourceScanner {

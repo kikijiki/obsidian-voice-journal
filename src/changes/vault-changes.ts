@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promi
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { createTwoFilesPatch } from 'diff';
 import type { Vault } from 'obsidian';
+import { isPathInside, isPathInsideOrEqual } from '../util/path-containment';
 
 export type VaultFileChangeKind = 'created' | 'modified' | 'deleted';
 export type DiffLineKind = 'addition' | 'deletion' | 'header' | 'context';
@@ -55,10 +56,6 @@ function vaultRelative(vaultRoot: string, path: string): string {
 	return relative(vaultRoot, path).split(sep).join('/');
 }
 
-function isInside(parent: string, candidate: string): boolean {
-	return candidate === parent || candidate.startsWith(`${parent}${sep}`);
-}
-
 /**
  * Walks every Markdown note in the vault and reads its content. `reuse`, when
  * given, is typically the result of the snapshot taken just before the agent
@@ -101,7 +98,7 @@ export async function snapshotVaultNotes(
 				if (
 					entry.name.startsWith('.') ||
 					IGNORED_DIRECTORY_NAMES.has(entry.name) ||
-					isInside(excludedArtifacts, resolve(path))
+					isPathInsideOrEqual(excludedArtifacts, resolve(path))
 				) {
 					continue;
 				}
@@ -207,7 +204,7 @@ export function effectiveBaselineSnapshot(
 function resolveVaultPath(vaultRoot: string, relativePath: string): string {
 	const root = resolve(vaultRoot);
 	const target = resolve(root, relativePath);
-	if (!target.startsWith(`${root}${sep}`)) {
+	if (!isPathInside(root, target)) {
 		throw new Error('Change path escapes the active vault.');
 	}
 	return target;

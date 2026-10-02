@@ -285,7 +285,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	async listSttModels(): Promise<string[]> {
-		if (this.coordinator.isRunning()) {
+		if (this.isBusy()) {
 			throw new Error('Wait for the active voice journal run to finish.');
 		}
 		return await this.coordinator.listSttModels();

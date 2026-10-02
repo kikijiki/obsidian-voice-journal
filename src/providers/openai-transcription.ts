@@ -19,6 +19,14 @@ export interface TranscriptionInput {
 	prompt?: string;
 	timestampGranularities?: Array<'word' | 'segment'>;
 	requestFormat?: TranscriptionRequestFormat;
+	/**
+	 * Checked before each retry backoff. Obsidian's `requestUrl` cannot abort
+	 * an in-flight request, so this cannot interrupt the current attempt, but
+	 * it stops the loop from starting another one: without it, a cancelled
+	 * run could still wait out up to two more full timeouts plus backoff
+	 * delays on a degraded endpoint before anything looks at cancellation.
+	 */
+	isCancelled?: () => boolean;
 }
 
 export interface TranscriptSegment {
@@ -231,6 +239,9 @@ export class OpenAiTranscriptionProvider {
 		for (const delayMs of this.retryDelaysMs) {
 			if (!RETRYABLE_STATUSES.has(response.status)) {
 				break;
+			}
+			if (input.isCancelled?.() === true) {
+				throw new Error('Voice journal run was cancelled.');
 			}
 			await wait(delayMs);
 			response = await send();

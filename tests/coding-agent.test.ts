@@ -370,7 +370,11 @@ describe('CodingAgentClient cancellation', () => {
 		expect(agent.cancelActiveRun()).toBe(false);
 	});
 
-	it('honours a cancel that arrives after the agent exited but before output drained', async () => {
+	it('does not retroactively cancel a run whose agent already exited successfully', async () => {
+		// A straggling grandchild still holding the output pipe open past the
+		// agent's own exit is reaped by runProcess()'s own exit-grace timer,
+		// not by cancelActiveRun(); a cancel click landing in that window must
+		// not discard a result the agent already decided.
 		const child = new EventEmitter() as ChildProcess;
 		Object.defineProperties(child, {
 			exitCode: { get: () => 0 },
@@ -390,11 +394,10 @@ describe('CodingAgentClient cancellation', () => {
 			});
 		const agent = new CodingAgentClient(runner);
 		const run = agent.run(baseSettings, '/vault', 'Edit.');
-		expect(agent.cancelActiveRun()).toBe(true);
+		expect(agent.cancelActiveRun()).toBe(false);
 		expect(kill).not.toHaveBeenCalled();
 		finish?.();
-		await expect(run).rejects.toThrow('cancelled');
-		expect(agent.cancelActiveRun()).toBe(false);
+		await expect(run).resolves.toEqual({ stdout: 'done', stderr: '' });
 	});
 });
 

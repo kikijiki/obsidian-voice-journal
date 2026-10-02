@@ -104,6 +104,15 @@ function freshCounters(): RunCounters {
 
 /** Stops a run after this many groups fail in a row, e.g. during a service outage. */
 const MAX_CONSECUTIVE_GROUP_FAILURES = 3;
+/**
+ * A group counts toward the streak above once at least this fraction of it
+ * failed, not only when every recording in it failed. A degraded dependency
+ * (e.g. STT timing out on most, but not literally all, uploads) should still
+ * trip the breaker; a single consistently bad file in an otherwise-healthy
+ * group should not, since that one recording's own MAX_RECORDING_ATTEMPTS
+ * cap already retires it without needing to stop the whole run.
+ */
+const GROUP_FAILURE_RATIO_THRESHOLD = 0.5;
 
 function isTerminal(state: RecordingState | undefined): boolean {
 	return state?.stage === 'complete' || state?.stage === 'failed';
@@ -584,9 +593,12 @@ export class PipelineCoordinator {
 			let groupFailed = false;
 			try {
 				const outcomes = await this.dependencies.processor.processBatch(inputs);
+				const failedInGroup = outcomes.filter(
+					(outcome) => outcome.result === 'failed',
+				).length;
 				groupFailed =
 					outcomes.length > 0 &&
-					outcomes.every((outcome) => outcome.result === 'failed');
+					failedInGroup / outcomes.length >= GROUP_FAILURE_RATIO_THRESHOLD;
 				for (const outcome of outcomes) {
 					if (outcome.result === 'skipped') {
 						skippedCount += 1;
