@@ -1,6 +1,6 @@
 import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { extname, isAbsolute, relative, resolve } from 'node:path';
+import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type {
 	AudioCandidate,
 	RecordingSource,
@@ -26,11 +26,30 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown filesystem error.';
 }
 
+function containingSource(
+	sources: RecordingSource[],
+	absolutePath: string,
+): RecordingSource | undefined {
+	return sources.find(
+		(source) =>
+			isAbsolute(source.path) &&
+			absolutePath.startsWith(`${resolve(source.path)}${sep}`),
+	);
+}
+
 export class SourceScanner {
-	/** Builds candidates directly from explicit file paths, bypassing configured recording sources. */
-	async scanPaths(absolutePaths: string[]): Promise<ScanResult> {
+	/**
+	 * Builds candidates directly from explicit file paths, bypassing the
+	 * configured source scan. A file inside a configured source still uses that
+	 * source's timestamp rules, so it lands in the same day as a scanned copy.
+	 */
+	async scanPaths(
+		absolutePaths: string[],
+		sources: RecordingSource[] = [],
+	): Promise<ScanResult> {
 		const candidates: AudioCandidate[] = [];
 		const errors: SourceScanError[] = [];
+		const warnings: SourceScanWarning[] = [];
 		for (const requestedPath of absolutePaths) {
 			if (!isAbsolute(requestedPath)) {
 				errors.push({
@@ -52,14 +71,38 @@ export class SourceScanner {
 					continue;
 				}
 				const fileName = absolutePath.split(/[/\\]/u).at(-1) ?? absolutePath;
+				const source = containingSource(sources, absolutePath);
+				let recordedAtMs: number | null = null;
+				if (source !== undefined) {
+					try {
+						recordedAtMs = resolveRecordingTimestamp(
+							source,
+							fileName,
+							fileStat.mtimeMs,
+						);
+					} catch {
+						recordedAtMs = null;
+					}
+					if (recordedAtMs === null) {
+						warnings.push({
+							sourceId: source.id,
+							path: absolutePath,
+							message:
+								'Filename does not match the source timestamp regex; using the file modification time.',
+						});
+					}
+				}
 				candidates.push({
-					sourceId: 'manual',
+					sourceId: source?.id ?? 'manual',
 					absolutePath,
-					relativePath: fileName,
+					relativePath:
+						source === undefined
+							? fileName
+							: relative(resolve(source.path), absolutePath),
 					fileName,
 					size: fileStat.size,
 					modifiedAtMs: fileStat.mtimeMs,
-					recordedAtMs: fileStat.mtimeMs,
+					recordedAtMs: recordedAtMs ?? fileStat.mtimeMs,
 				});
 			} catch (error) {
 				errors.push({
@@ -70,7 +113,7 @@ export class SourceScanner {
 			}
 		}
 		candidates.sort((left, right) => left.recordedAtMs - right.recordedAtMs);
-		return { candidates, errors, warnings: [] };
+		return { candidates, errors, warnings };
 	}
 
 	async scan(
@@ -142,6 +185,9 @@ export class SourceScanner {
 			}
 
 			for (const entry of entries) {
+				if (budget.exhausted) {
+					return;
+				}
 				if (budget.visited >= budget.limit) {
 					budget.exhausted = true;
 					errors.push({

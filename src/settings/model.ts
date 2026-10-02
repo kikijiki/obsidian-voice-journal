@@ -26,7 +26,6 @@ export const DEFAULT_SETTINGS: VoiceJournalSettings = {
 	recordingSources: [],
 	recordingGrouping: 'day',
 	journalDirectory: 'Journal',
-	hideSourcesProperty: true,
 	codingAgentType: 'pi',
 	codingAgentExecutable: 'pi',
 	codingAgentModel: '',
@@ -43,7 +42,6 @@ export const DEFAULT_AGENT_EXECUTABLES: Record<CodingAgentType, string> = {
 	pi: 'pi',
 	claude: 'claude',
 	codex: 'codex',
-	cursor: 'cursor-agent',
 };
 
 export const DEFAULT_RUNTIME: RuntimeState = {
@@ -91,14 +89,11 @@ function parseStartupMode(value: unknown): StartupMode {
 }
 
 function parseCodingAgentType(value: unknown): CodingAgentType {
-	if (
-		value === 'claude' ||
-		value === 'codex' ||
-		value === 'cursor' ||
-		value === 'pi'
-	) {
+	if (value === 'claude' || value === 'codex' || value === 'pi') {
 		return value;
 	}
+	// A vault that previously selected the now-removed Cursor agent falls
+	// back to the default instead of landing on an invalid executable.
 	return DEFAULT_SETTINGS.codingAgentType;
 }
 
@@ -147,15 +142,17 @@ function parseSources(value: unknown): RecordingSource[] {
 		return [];
 	}
 
+	const seenIds = new Set<string>();
 	return value.flatMap((entry): RecordingSource[] => {
 		if (!isRecord(entry)) {
 			return [];
 		}
 		const id = readString(entry.id, '').trim();
 		const sourcePath = readString(entry.path, '').trim();
-		if (id === '') {
+		if (id === '' || seenIds.has(id)) {
 			return [];
 		}
+		seenIds.add(id);
 		const extensions = Array.isArray(entry.extensions)
 			? entry.extensions.filter(
 					(extension): extension is string => typeof extension === 'string',
@@ -240,7 +237,8 @@ function parseRecordingStage(value: unknown): RecordingStage | null {
 		value === 'discovered' ||
 		value === 'copied' ||
 		value === 'transcribed' ||
-		value === 'complete'
+		value === 'complete' ||
+		value === 'failed'
 	) {
 		return value;
 	}
@@ -273,6 +271,10 @@ function parseRecordings(value: unknown): RuntimeState['recordings'] {
 							typeof entry.sourceModifiedAtMs === 'number'
 								? entry.sourceModifiedAtMs
 								: undefined,
+						recordedAtMs:
+							typeof entry.recordedAtMs === 'number'
+								? entry.recordedAtMs
+								: undefined,
 						archivedAudioPath:
 							typeof entry.archivedAudioPath === 'string'
 								? entry.archivedAudioPath
@@ -289,6 +291,19 @@ function parseRecordings(value: unknown): RuntimeState['recordings'] {
 						updatedAt: readString(entry.updatedAt, ''),
 						lastError:
 							typeof entry.lastError === 'string' ? entry.lastError : undefined,
+						agentStartedAt:
+							typeof entry.agentStartedAt === 'string'
+								? entry.agentStartedAt
+								: undefined,
+						completedAt:
+							typeof entry.completedAt === 'string'
+								? entry.completedAt
+								: undefined,
+						notePaths: Array.isArray(entry.notePaths)
+							? entry.notePaths.filter(
+									(path): path is string => typeof path === 'string',
+								)
+							: undefined,
 					},
 				],
 			];
@@ -336,10 +351,6 @@ export function parsePluginData(value: unknown): PersistedPluginData {
 					DEFAULT_SETTINGS.journalDirectory,
 				),
 			) || DEFAULT_SETTINGS.journalDirectory,
-		hideSourcesProperty: readBoolean(
-			settingsValue.hideSourcesProperty,
-			DEFAULT_SETTINGS.hideSourcesProperty,
-		),
 		codingAgentType,
 		codingAgentExecutable: configuredExecutable,
 		codingAgentModel: readString(

@@ -4,18 +4,6 @@
 	align-items: center;
 }
 
-/*
- * Hides the voice_journal_sources provenance property from the rendered
- * Properties panel when the "Hide source markers property" setting is on.
- * Only affects rendering; raw frontmatter is untouched and still visible in
- * Source mode. Keep the property key in sync with
- * VOICE_JOURNAL_SOURCES_PROPERTY in src/pipeline/recording-processor.ts.
- */
-body.voice-journal-hide-sources-property
-	.metadata-property[data-property-key='voice_journal_sources'] {
-	display: none;
-}
-
 .voice-journal-setting-warning {
 	color: var(--text-warning);
 }
@@ -500,14 +488,22 @@ body.voice-journal-hide-sources-property
 	border-left: 0;
 }
 
-.voice-journal-activity__event.is-expandable {
+.voice-journal-activity__agent-summary.is-expandable {
+	margin: calc(var(--size-2-1) * -1);
+	padding: var(--size-2-1);
+	border-radius: var(--radius-s);
 	cursor: pointer;
 }
 
-.voice-journal-activity__event.is-expandable:hover,
-.voice-journal-activity__event.is-expandable:focus-visible {
+.voice-journal-activity__agent-summary.is-expandable:hover {
 	background: var(--background-modifier-hover);
-	outline: none;
+}
+
+.voice-journal-activity__agent-summary.is-expandable:focus-visible,
+.voice-journal-activity__change-toggle.is-expandable:focus-visible,
+.voice-journal-activity__change-action:focus-visible {
+	outline: 2px solid var(--background-modifier-border-focus);
+	outline-offset: 1px;
 }
 
 .voice-journal-activity__event-meta {
@@ -722,17 +718,24 @@ body.voice-journal-hide-sources-property
 	gap: var(--size-2-2);
 }
 
-.voice-journal-activity__change-summary.is-expandable {
-	margin: 0 calc(var(--size-2-2) * -1);
+.voice-journal-activity__change-toggle {
+	display: flex;
+	min-width: 0;
+	flex: 1 1 auto;
+	align-items: center;
+	gap: var(--size-2-2);
+}
+
+.voice-journal-activity__change-toggle.is-expandable {
+	margin: calc(var(--size-2-2) * -1) 0 calc(var(--size-2-2) * -1)
+		calc(var(--size-2-2) * -1);
 	padding: var(--size-2-2);
 	border-radius: var(--radius-s);
 	cursor: pointer;
 }
 
-.voice-journal-activity__change-summary.is-expandable:hover,
-.voice-journal-activity__change-summary.is-expandable:focus-visible {
+.voice-journal-activity__change-toggle.is-expandable:hover {
 	background: var(--background-modifier-hover);
-	outline: none;
 }
 
 .voice-journal-activity__change-path {
@@ -758,20 +761,18 @@ body.voice-journal-hide-sources-property
 	gap: var(--size-2-2);
 }
 
-.voice-journal-activity__change-action {
-	appearance: none !important;
+/* Rendered with Obsidian's .clickable-icon, which already drops the default
+ * button chrome; only the size is adjusted here. */
+.voice-journal-activity__change-action.clickable-icon {
 	display: inline-flex;
-	width: var(--icon-s);
-	height: var(--icon-s);
+	width: auto;
+	height: auto;
 	min-width: var(--icon-s);
 	min-height: var(--icon-s);
 	align-items: center;
 	justify-content: center;
-	padding: 0 !important;
-	border: 0 !important;
-	box-shadow: none !important;
+	padding: var(--size-2-1);
 	color: var(--text-muted);
-	background: transparent !important;
 }
 
 .voice-journal-activity__change-action svg {

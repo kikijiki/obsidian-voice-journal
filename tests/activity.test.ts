@@ -29,6 +29,24 @@ describe('AgentLineBuffer', () => {
 		).toEqual(['{"type":"text","part":{"text":"hello"}}']);
 	});
 
+	it('splits CRLF output, including a CR/LF pair split across chunks', () => {
+		const buffer = new AgentLineBuffer();
+		expect(buffer.push('stdout', '{"a":1}\r\n{"b":2}\r')).toEqual(['{"a":1}']);
+		expect(buffer.push('stdout', '\n{"c":3}\r\n')).toEqual([
+			'{"b":2}',
+			'{"c":3}',
+		]);
+		expect(buffer.push('stdout', 'tail\r')).toEqual([]);
+		expect(buffer.flush('stdout')).toEqual(['tail']);
+	});
+
+	it('keeps stdout and stderr partial lines separate', () => {
+		const buffer = new AgentLineBuffer();
+		expect(buffer.push('stdout', 'out-')).toEqual([]);
+		expect(buffer.push('stderr', 'err\n')).toEqual(['err']);
+		expect(buffer.push('stdout', 'line\n')).toEqual(['out-line']);
+	});
+
 	it('creates a readable label and human-readable event details', () => {
 		const line = '{"type":"text","part":{"text":"hello"}}';
 		expect(formatAgentLine(line)).toEqual({
@@ -447,6 +465,141 @@ describe('AgentOutputPresenter', () => {
 	});
 });
 
+describe('AgentOutputPresenter edge cases', () => {
+	it.each(['pi', 'claude', 'codex'] as const)(
+		'renders malformed or partial %s JSON lines as plain output',
+		(type) => {
+			const presenter = new AgentOutputPresenter(type);
+			expect(presenter.push('{"type":"assistant","message":')).toEqual([
+				expect.objectContaining({
+					title: 'Agent output',
+					message: '{"type":"assistant","message":',
+				}),
+			]);
+			expect(presenter.push('plain stderr text')).toEqual([
+				expect.objectContaining({ message: 'plain stderr text' }),
+			]);
+			expect(presenter.push('[1,2]')).toHaveLength(1);
+		},
+	);
+
+	it('surfaces failed Claude results as error rows', () => {
+		const presenter = new AgentOutputPresenter('claude');
+		const [failure] = presenter.push(
+			'{"type":"result","subtype":"error_max_turns","is_error":true}',
+		);
+		expect(failure).toMatchObject({
+			level: 'error',
+			status: 'failed',
+			persist: true,
+		});
+		expect(failure?.message).toContain('max turns');
+		const [explicit] = presenter.push(
+			'{"type":"result","subtype":"success","is_error":true,"result":"API Error: 529 overloaded"}',
+		);
+		expect(explicit).toMatchObject({
+			level: 'error',
+			message: 'API Error: 529 overloaded',
+		});
+	});
+
+	it('never reuses a Claude fallback tool id', () => {
+		const presenter = new AgentOutputPresenter('claude');
+		const toolUse = JSON.stringify({
+			type: 'assistant',
+			message: {
+				role: 'assistant',
+				content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'a.md' } }],
+			},
+		});
+		const orphanResult = JSON.stringify({
+			type: 'user',
+			message: {
+				role: 'user',
+				content: [{ type: 'tool_result', content: 'ok' }],
+			},
+		});
+		const keys = [
+			presenter.push(toolUse)[0]?.replaceKey,
+			presenter.push(orphanResult)[0]?.replaceKey,
+			presenter.push(toolUse)[0]?.replaceKey,
+			presenter.push(orphanResult)[0]?.replaceKey,
+		];
+		expect(keys.every((key) => key !== undefined)).toBe(true);
+		expect(new Set(keys).size).toBe(keys.length);
+	});
+
+	it('surfaces Codex errors and failed turns as error rows', () => {
+		const presenter = new AgentOutputPresenter('codex');
+		expect(
+			presenter.push('{"type":"error","message":"stream disconnected"}')[0],
+		).toMatchObject({
+			title: 'Codex error',
+			message: 'stream disconnected',
+			level: 'error',
+		});
+		expect(
+			presenter.push(
+				'{"type":"turn.failed","error":{"message":"usage limit reached"}}',
+			)[0],
+		).toMatchObject({
+			title: 'Codex turn failed',
+			message: 'usage limit reached',
+			level: 'error',
+			status: 'failed',
+		});
+	});
+
+	it('updates the existing Codex row on item.updated', () => {
+		const presenter = new AgentOutputPresenter('codex');
+		const [started] = presenter.push(
+			'{"type":"item.started","item":{"id":"item_5","type":"todo_list","items":[{"text":"a","completed":false}]}}',
+		);
+		const updated = presenter.push(
+			'{"type":"item.updated","item":{"id":"item_5","type":"todo_list","items":[{"text":"a","completed":true}]}}',
+		);
+		expect(updated).toHaveLength(1);
+		expect(updated[0]).toMatchObject({
+			replaceKey: started?.replaceKey,
+			status: 'running',
+			persist: false,
+		});
+		expect(updated[0]?.detail).toContain('completed: true');
+		const [completed] = presenter.push(
+			'{"type":"item.completed","item":{"id":"item_5","type":"todo_list","items":[{"text":"a","completed":true}]}}',
+		);
+		expect(completed).toMatchObject({
+			replaceKey: started?.replaceKey,
+			status: 'succeeded',
+		});
+		expect(presenter.flush()).toEqual([]);
+	});
+
+	it('finalizes unfinished Pi content when the next message starts', () => {
+		const presenter = new AgentOutputPresenter('pi');
+		const [streaming] = presenter.push(
+			'{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Partial"}}',
+		);
+		expect(streaming).toMatchObject({ status: 'running' });
+		const finalized = presenter.push(
+			'{"type":"message_start","message":{"role":"assistant"}}',
+		);
+		expect(finalized).toEqual([
+			expect.objectContaining({
+				message: 'Partial',
+				replaceKey: streaming?.replaceKey,
+				status: 'succeeded',
+				persist: true,
+			}),
+		]);
+		const [next] = presenter.push(
+			'{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}',
+		);
+		expect(next?.replaceKey).not.toBe(streaming?.replaceKey);
+		expect(presenter.flush()).toHaveLength(1);
+	});
+});
+
 describe('ActivityLog', () => {
 	it('retains the structured summary for the final failure report', async () => {
 		const artifactRoot = await mkdtemp(join(tmpdir(), 'voice-journal-log-'));
@@ -564,5 +717,46 @@ describe('ActivityLog', () => {
 		await log.clearView();
 		await expect(readdir(join(artifactRoot, 'runs'))).rejects.toThrow();
 		expect(log.getEvents()).toEqual([]);
+	});
+
+	it('keeps logging after the view is cleared mid-run', async () => {
+		const artifactRoot = await mkdtemp(join(tmpdir(), 'voice-journal-log-'));
+		temporaryDirectories.push(artifactRoot);
+		const log = new ActivityLog();
+		await log.startRun(artifactRoot, 'command', 'scan-and-process');
+		await log.clearView();
+		expect(log.getRunId()).not.toBeNull();
+		log.add({ kind: 'pipeline', title: 'Event after clearing' });
+		await log.flush();
+
+		const files = await readdir(join(artifactRoot, 'runs'));
+		expect(files).toHaveLength(1);
+		const contents = await readFile(
+			join(artifactRoot, 'runs', files[0] ?? ''),
+			'utf8',
+		);
+		expect(contents).toContain('Event after clearing');
+		expect(log.getEvents()).toHaveLength(1);
+	});
+
+	it('never evicts change reports when the in-memory cap is reached', async () => {
+		const artifactRoot = await mkdtemp(join(tmpdir(), 'voice-journal-log-'));
+		temporaryDirectories.push(artifactRoot);
+		const log = new ActivityLog();
+		await log.startRun(artifactRoot, 'command', 'scan-and-process');
+		const report = log.add({
+			kind: 'changes',
+			title: 'Vault changes',
+			changes: [],
+			persist: false,
+		});
+		for (let index = 0; index < 2_100; index += 1) {
+			log.add({ kind: 'agent', title: `Row ${index.toString()}`, persist: false });
+		}
+		const events = log.getEvents();
+		expect(events).toHaveLength(2_000);
+		expect(events.some((event) => event.id === report?.id)).toBe(true);
+		expect(events.at(-1)?.title).toBe('Row 2099');
+		expect(events.some((event) => event.title === 'Row 0')).toBe(false);
 	});
 });

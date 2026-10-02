@@ -10,13 +10,29 @@ describe('planChunkSeconds', () => {
 		expect(planChunkSeconds(5 * 1024 * 1024, 120)).toBeNull();
 	});
 
-	it('splits uncompressed audio by size', () => {
+	it('splits uncompressed audio by size with a safety margin', () => {
 		// 66.6 MB over 484 s is the 48 kHz 24-bit mono DJI recording.
 		const seconds = planChunkSeconds(69_807_976, 484.55);
-		expect(seconds).toBe(145);
+		expect(seconds).toBe(131);
 		expect((69_807_976 / 484.55) * (seconds ?? 0)).toBeLessThanOrEqual(
+			STT_MAX_CHUNK_BYTES * 0.9,
+		);
+	});
+
+	it('never lets the minimum chunk length exceed the size limit', () => {
+		// 10 MB/s: a 10 s floor would produce 100 MB chunks.
+		const bytesPerSecond = 10 * 1024 * 1024;
+		const seconds = planChunkSeconds(bytesPerSecond * 600, 600);
+		expect(seconds).toBe(1);
+		expect(bytesPerSecond * (seconds ?? 0)).toBeLessThanOrEqual(
 			STT_MAX_CHUNK_BYTES,
 		);
+	});
+
+	it('refuses to split when even one second exceeds the size limit', () => {
+		expect(() =>
+			planChunkSeconds(STT_MAX_CHUNK_BYTES * 100, 50),
+		).toThrow(/bitrate/i);
 	});
 
 	it('splits small but long compressed audio by time', () => {

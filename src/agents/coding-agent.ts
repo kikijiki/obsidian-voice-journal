@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import {
 	clearTimeout as cancelTimeout,
@@ -9,6 +8,12 @@ import type {
 	CodingAgentType,
 	VoiceJournalSettings,
 } from '../model';
+import {
+	describeTermination,
+	killProcessTree,
+	runProcess,
+} from '../process/run-process';
+import { spawnEnvironment } from '../process/spawn-environment';
 
 interface CommandResult {
 	stdout: string;
@@ -53,115 +58,96 @@ export type CodingAgentCommandRunner = (
 	options: CommandOptions,
 ) => Promise<CommandResult>;
 
-const MAX_CAPTURED_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_CAPTURED_OUTPUT_CHARS = 4 * 1024 * 1024;
+const MAX_ERROR_DETAIL_CHARS = 4_000;
 
-function appendOutputTail(current: string, chunk: string): string {
-	const combined = current + chunk;
-	if (Buffer.byteLength(combined, 'utf8') <= MAX_CAPTURED_OUTPUT_BYTES) {
-		return combined;
+// Claude Code's stream-json output ends with a `result` event. When a run
+// fails before anything reaches stderr (API errors, max turns, ...), that
+// event is the only place the reason is reported.
+export function streamJsonResultError(stdout: string): string | null {
+	const lines = stdout.trimEnd().split(/\r?\n/u).slice(-50).reverse();
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith('{') || !trimmed.includes('"result"')) {
+			continue;
+		}
+		let event: unknown;
+		try {
+			event = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (typeof event !== 'object' || event === null) {
+			continue;
+		}
+		const record = event as Record<string, unknown>;
+		if (record.type !== 'result') {
+			continue;
+		}
+		const subtype = typeof record.subtype === 'string' ? record.subtype : '';
+		if (record.is_error !== true && !subtype.startsWith('error')) {
+			return null;
+		}
+		if (typeof record.result === 'string' && record.result.trim() !== '') {
+			return record.result.trim();
+		}
+		if (Array.isArray(record.errors)) {
+			const errors = record.errors.filter(
+				(entry): entry is string => typeof entry === 'string' && entry !== '',
+			);
+			if (errors.length > 0) {
+				return errors.join('\n');
+			}
+		}
+		return subtype === '' ? 'the agent reported an error' : subtype;
 	}
-	return Buffer.from(combined, 'utf8')
-		.subarray(-MAX_CAPTURED_OUTPUT_BYTES)
-		.toString('utf8');
+	return null;
 }
 
-export function executeCommand(
+export async function executeCommand(
 	executable: string,
 	args: string[],
 	options: CommandOptions,
 ): Promise<CommandResult> {
-	return new Promise((resolve, reject) => {
-		let stdout = '';
-		let stderr = '';
-		let timedOut = false;
-		let settled = false;
-		let forceTimer: ReturnType<typeof scheduleTimeout> | undefined;
-		const child = spawn(executable, args, {
-			cwd: options.cwd,
-			env: {
-				...codingAgentEnvironment(process.env),
-				...(options.cwd === undefined ? {} : { PWD: options.cwd }),
-			},
-			stdio: ['pipe', 'pipe', 'pipe'],
-		});
-		const timeout =
-			options.timeoutMs > 0
-				? scheduleTimeout(() => {
-						timedOut = true;
-						child.kill('SIGTERM');
-						forceTimer = scheduleTimeout(
-							() => child.kill('SIGKILL'),
-							3_000,
-						);
-					}, options.timeoutMs)
-				: undefined;
-		const clearTimers = (): void => {
-			if (timeout !== undefined) {
-				cancelTimeout(timeout);
-			}
-			if (forceTimer !== undefined) {
-				cancelTimeout(forceTimer);
-			}
-		};
-		const fail = (error: Error): void => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			clearTimers();
-			reject(error);
-		};
-		// Print-mode agents inspect piped stdin before processing positional
-		// prompts. Leaving the default child-process pipe open makes Pi wait
-		// forever for EOF before it emits its first JSON event.
-		child.stdin?.on('error', () => {
-			// The agent may exit before consuming stdin; the process callback owns
-			// command failure reporting.
-		});
-		child.stdin?.end();
-		options.onSpawn?.(child);
-		child.stdout?.on('data', (chunk: string | Buffer) => {
-			const text = chunk.toString();
-			stdout = appendOutputTail(stdout, text);
-			options.onStdout?.(text);
-		});
-		child.stderr?.on('data', (chunk: string | Buffer) => {
-			const text = chunk.toString();
-			stderr = appendOutputTail(stderr, text);
-			options.onStderr?.(text);
-		});
-		child.once('error', (error) => fail(error));
-		child.once('close', (code, signal) => {
-			if (settled) {
-				return;
-			}
-			clearTimers();
-			if (code === 0 && !timedOut) {
-				settled = true;
-				resolve({ stdout, stderr });
-				return;
-			}
-			const diagnostic = stderr.trim().slice(-4_000);
-			const reason = timedOut
-				? `timed out after ${options.timeoutMs.toString()} ms`
-				: (code?.toString() ?? signal ?? 'unknown error');
-			fail(
-				new Error(
-					diagnostic === ''
-						? `Coding-agent command failed (${reason}).`
-						: `Coding-agent command failed: ${diagnostic}`,
-				),
-			);
-		});
+	const env = await spawnEnvironment(executable, {
+		...codingAgentEnvironment(process.env),
+		...(options.cwd === undefined ? {} : { PWD: options.cwd }),
 	});
+	const result = await runProcess(executable, args, {
+		cwd: options.cwd,
+		env,
+		timeoutMs: options.timeoutMs,
+		// Print-mode agents inspect piped stdin before processing positional
+		// prompts. Leaving the pipe open makes Pi wait forever for EOF before
+		// it emits its first JSON event.
+		stdin: 'close',
+		maxOutputChars: MAX_CAPTURED_OUTPUT_CHARS,
+		onStdout: options.onStdout,
+		onStderr: options.onStderr,
+		onSpawn: options.onSpawn,
+	});
+	if (result.code === 0 && result.signal === null && !result.timedOut) {
+		return { stdout: result.stdout, stderr: result.stderr };
+	}
+	const reason = describeTermination(result, options.timeoutMs);
+	const diagnostic =
+		result.stderr.trim().slice(-MAX_ERROR_DETAIL_CHARS) ||
+		(streamJsonResultError(result.stdout) ?? '').slice(-MAX_ERROR_DETAIL_CHARS);
+	throw new Error(
+		diagnostic === ''
+			? `Coding-agent command failed (${reason}).`
+			: `Coding-agent command failed (${reason}): ${diagnostic}`,
+	);
 }
+
+const CLAUDE_FILE_TOOLS = 'Read,Edit,Write,Glob,Grep,LS';
+const CLAUDE_DENIED_TOOLS = 'Bash,WebFetch,WebSearch,Task,NotebookEdit';
 
 export function codingAgentName(type: CodingAgentType): string {
 	return {
 		pi: 'Pi',
 		claude: 'Claude Code',
 		codex: 'Codex',
-		cursor: 'Cursor',
 	}[type];
 }
 
@@ -210,8 +196,22 @@ export function buildAgentInvocation(
 				'stream-json',
 				'--verbose',
 				'--no-session-persistence',
+				// The transcript is untrusted input: expose only the file tools,
+				// deny anything that runs commands or reaches the network, and
+				// ignore every configured MCP server. The variadic options are
+				// each followed by another flag so none of them swallows the
+				// positional prompt.
+				'--tools',
+				CLAUDE_FILE_TOOLS,
+				'--allowedTools',
+				CLAUDE_FILE_TOOLS,
+				'--disallowedTools',
+				CLAUDE_DENIED_TOOLS,
+				'--mcp-config',
+				'{"mcpServers":{}}',
+				'--strict-mcp-config',
 				'--permission-mode',
-				'bypassPermissions',
+				'acceptEdits',
 				...modelArgs,
 				prompt,
 			];
@@ -223,20 +223,15 @@ export function buildAgentInvocation(
 				'--cd',
 				vaultPath,
 				'--skip-git-repo-check',
-				'--dangerously-bypass-approvals-and-sandbox',
-				...modelArgs,
-				prompt,
-			];
-			break;
-		case 'cursor':
-			args = [
-				'--print',
-				'--output-format',
-				'stream-json',
-				'--workspace',
-				vaultPath,
-				'--trust',
-				'--force',
+				// Model-generated commands may only write inside the vault and
+				// never reach the network; failures go straight back to the
+				// model because nobody is there to approve anything.
+				'--sandbox',
+				'workspace-write',
+				'-c',
+				'approval_policy="never"',
+				'-c',
+				'sandbox_workspace_write.network_access=false',
 				...modelArgs,
 				prompt,
 			];
@@ -249,9 +244,6 @@ export function buildAgentInvocation(
 function modelListArgs(type: CodingAgentType, model = ''): string[] {
 	if (type === 'pi') {
 		return model === '' ? ['--list-models'] : ['--list-models', model];
-	}
-	if (type === 'cursor') {
-		return ['--list-models'];
 	}
 	if (type === 'codex') {
 		return ['debug', 'models'];
@@ -270,11 +262,6 @@ export function parseListedModels(
 			return match?.[1] === undefined || match[2] === undefined || match[1] === 'provider'
 				? []
 				: [`${match[1]}/${match[2]}`];
-		});
-	} else if (type === 'cursor') {
-		models = output.split(/\r?\n/u).flatMap((line) => {
-			const match = line.trim().match(/^([^\s]+)\s+-\s+.+$/u);
-			return match?.[1] === undefined ? [] : [match[1]];
 		});
 	} else if (type === 'codex') {
 		try {
@@ -357,9 +344,10 @@ export class CodingAgentClient {
 			throw new Error('A coding-agent run is already active.');
 		}
 		this.cancelRequested = false;
+		let result: AgentRunResult;
 		try {
 			const invocation = buildAgentInvocation(settings, vaultPath, prompt);
-			return await this.commandRunner(invocation.executable, invocation.args, {
+			result = await this.commandRunner(invocation.executable, invocation.args, {
 				cwd: invocation.cwd,
 				timeoutMs: this.runTimeoutMs,
 				onStdout: (chunk) => onOutput?.('stdout', chunk),
@@ -377,13 +365,23 @@ export class CodingAgentClient {
 		} finally {
 			this.activeChild = null;
 		}
+		// A cancelled agent may still exit cleanly (it handles SIGTERM, or it
+		// finished just as the cancel arrived); its edits must not be treated
+		// as a completed run either way.
+		if (this.cancelRequested) {
+			throw new Error('Coding-agent run was cancelled.');
+		}
+		return result;
 	}
 
 	cancelActiveRun(): boolean {
 		const child = this.activeChild;
-		if (child === null || !this.isAlive(child)) {
+		if (child === null) {
 			return false;
 		}
+		// The run stays active until its output has drained, which can
+		// outlast the agent process itself, so a cancel is still honoured
+		// after the child has exited.
 		this.cancelRequested = true;
 		this.terminateChild(child);
 		return true;
@@ -503,12 +501,12 @@ export class CodingAgentClient {
 		const timer = scheduleTimeout(() => {
 			this.terminationTimers.delete(child);
 			if (this.isAlive(child)) {
-				child.kill('SIGKILL');
+				killProcessTree(child, 'SIGKILL');
 			}
 		}, 3_000);
 		this.terminationTimers.set(child, timer);
 		child.once('exit', () => this.clearTerminationTimer(child));
-		child.kill('SIGTERM');
+		killProcessTree(child, 'SIGTERM');
 	}
 
 	private clearTerminationTimer(child: ChildProcess): void {

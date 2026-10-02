@@ -29,4 +29,10 @@ describe('plugin artifact storage', () => {
 		);
 		expect(await readFile(join(root, '.gitignore'), 'utf8')).toBe('*\n');
 	});
+
+	it('accepts a vault at the filesystem root', () => {
+		expect(resolvePluginArtifactRoot('/', 'config', 'voice')).toBe(
+			'/config/plugins/voice/.voice-journal',
+		);
+	});
 });

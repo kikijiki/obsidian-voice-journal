@@ -5,7 +5,6 @@ import { PiOutputPresenter } from './agent-output/pi-presenter';
 import {
 	type AgentProtocolPresenter,
 	type FormattedAgentLine,
-	formatAgentLine,
 	record,
 } from './agent-output/shared';
 
@@ -13,24 +12,31 @@ export type { FormattedAgentLine } from './agent-output/shared';
 export { formatAgentLine } from './agent-output/shared';
 export { AgentLineBuffer } from './agent-output/line-buffer';
 
-class GenericOutputPresenter implements AgentProtocolPresenter {
-	push(line: string): FormattedAgentLine[] {
-		return [formatAgentLine(line)];
-	}
-
-	flush(): FormattedAgentLine[] {
-		return [];
-	}
-}
-
 export function agentTurnStarted(line: string): boolean {
 	try {
 		const type = record(JSON.parse(line.trim()))?.type;
 		return (
-			type === 'turn_start' || type === 'turn.started' || type === 'assistant'
+			type === 'turn_start' ||
+			type === 'turn.started' ||
+			type === 'assistant' ||
+			type === 'thinking'
 		);
 	} catch {
 		return false;
+	}
+}
+
+function createPresenter(
+	type: CodingAgentType,
+	scope: string,
+): AgentProtocolPresenter {
+	switch (type) {
+		case 'pi':
+			return new PiOutputPresenter(scope);
+		case 'codex':
+			return new CodexOutputPresenter(scope);
+		case 'claude':
+			return new ClaudeOutputPresenter(scope);
 	}
 }
 
@@ -38,14 +44,7 @@ export class AgentOutputPresenter implements AgentProtocolPresenter {
 	private readonly presenter: AgentProtocolPresenter;
 
 	constructor(type: CodingAgentType, scope = 'agent') {
-		this.presenter =
-			type === 'pi'
-				? new PiOutputPresenter(scope)
-				: type === 'codex'
-					? new CodexOutputPresenter(scope)
-					: type === 'claude'
-						? new ClaudeOutputPresenter(scope)
-						: new GenericOutputPresenter();
+		this.presenter = createPresenter(type, scope);
 	}
 
 	push(line: string): FormattedAgentLine[] {

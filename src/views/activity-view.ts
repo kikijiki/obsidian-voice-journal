@@ -47,8 +47,49 @@ const AUDIO_FILE_EXTENSIONS = [
 	'.opus',
 ];
 
+const HEALTH_CHECK_INTERVAL_MS = 5 * 60_000;
+
+interface ElectronWebUtils {
+	getPathForFile: (file: File) => string;
+}
+
+function electronWebUtils(): ElectronWebUtils | undefined {
+	const load = (window as Window & { require?: (id: string) => unknown }).require;
+	if (typeof load !== 'function') {
+		return undefined;
+	}
+	try {
+		const electron = load('electron');
+		const webUtils =
+			typeof electron === 'object' && electron !== null && 'webUtils' in electron
+				? (electron as { webUtils?: unknown }).webUtils
+				: undefined;
+		return typeof webUtils === 'object' &&
+			webUtils !== null &&
+			'getPathForFile' in webUtils &&
+			typeof (webUtils as { getPathForFile?: unknown }).getPathForFile ===
+				'function'
+			? (webUtils as ElectronWebUtils)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Absolute path of a dropped/picked file. Electron 32+ removed `File.path`;
+ * `webUtils.getPathForFile` replaces it. The legacy property is the fallback.
+ */
 function electronFilePath(file: File): string | undefined {
-	const path = (file as File & { path?: string }).path;
+	let path: unknown;
+	try {
+		path = electronWebUtils()?.getPathForFile(file);
+	} catch {
+		path = undefined;
+	}
+	if (typeof path !== 'string' || path === '') {
+		path = (file as File & { path?: unknown }).path;
+	}
 	return typeof path === 'string' && path !== '' ? path : undefined;
 }
 
@@ -105,13 +146,14 @@ function filterLabel(filter: ActivityFilter): string {
 	}[filter];
 }
 
-class RevertConfirmationModal extends Modal {
+class ConfirmationModal extends Modal {
 	private settled = false;
 
 	constructor(
 		app: App,
 		private readonly heading: string,
 		private readonly message: string,
+		private readonly confirmText: string,
 		private readonly settle: (confirmed: boolean) => void,
 	) {
 		super(app);
@@ -126,7 +168,7 @@ class RevertConfirmationModal extends Modal {
 			)
 			.addButton((button) =>
 				button
-					.setButtonText('Revert')
+					.setButtonText(this.confirmText)
 					.setDestructive()
 					.setCta()
 					.onClick(() => this.finish(true)),
@@ -163,13 +205,29 @@ export class VoiceJournalActivityView extends ItemView {
 	private followUpSending = false;
 	private statusEl: HTMLElement | null = null;
 	private runButton: HTMLButtonElement | null = null;
+	private clearButton: HTMLButtonElement | null = null;
 	private sttIndicator: ServiceIndicator | null = null;
 	private agentIndicator: ServiceIndicator | null = null;
 	private healthCheckPending = false;
 	private healthCheckGeneration = 0;
+	/** A periodic check was skipped (busy or hidden); run it when possible. */
+	private healthCheckStale = false;
 	private unsubscribe: (() => void) | null = null;
 	private pinnedToBottom = true;
 	private readonly expandedDetails = new Set<string>();
+	// Rendering is batched to one frame and only touches what changed.
+	private renderFrame: { win: Window; handle: number } | null = null;
+	private renderedSourcesKey: string | null = null;
+	/** undefined: never rendered; null: rendered with no failure. */
+	private renderedFailure: ActivityEvent | null | undefined = undefined;
+	private renderedReports: readonly ActivityEvent[] | null = null;
+	private renderedReportsBusy = false;
+	private renderedFilter: ActivityFilter | null = null;
+	private readonly feedRows = new Map<
+		string,
+		{ event: ActivityEvent; el: HTMLElement }
+	>();
+	private feedEmptyEl: HTMLElement | null = null;
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -194,21 +252,23 @@ export class VoiceJournalActivityView extends ItemView {
 		this.renderShell();
 		this.unsubscribe = this.host.activity.subscribe((events) => {
 			this.events = events;
-			this.renderStatus();
-			this.renderFailureReport();
-			this.renderChangeReports();
-			this.renderFeed();
+			this.scheduleRender();
 		});
 		this.registerInterval(
 			window.setInterval(() => {
 				this.renderStatus();
 				this.renderSources();
+				// Catches run/follow-up state changes that emit no activity event.
+				this.renderChangeReports();
+				if (this.healthCheckStale) {
+					void this.refreshServiceHealth();
+				}
 			}, 1_000),
 		);
 		this.registerInterval(
 			window.setInterval(() => {
 				void this.refreshServiceHealth();
-			}, 60_000),
+			}, HEALTH_CHECK_INTERVAL_MS),
 		);
 		void this.refreshServiceHealth();
 	}
@@ -218,6 +278,13 @@ export class VoiceJournalActivityView extends ItemView {
 		this.healthCheckPending = false;
 		this.unsubscribe?.();
 		this.unsubscribe = null;
+		if (this.renderFrame !== null) {
+			this.renderFrame.win.cancelAnimationFrame(this.renderFrame.handle);
+			this.renderFrame = null;
+		}
+		this.feedRows.clear();
+		this.feedEmptyEl = null;
+		this.clearButton = null;
 		this.sttIndicator = null;
 		this.agentIndicator = null;
 		this.failureReportEl = null;
@@ -226,9 +293,39 @@ export class VoiceJournalActivityView extends ItemView {
 		this.followUpTextarea = null;
 	}
 
+	/** Coalesces bursts of activity events (e.g. streamed tokens) into one render per frame. */
+	private scheduleRender(): void {
+		if (this.renderFrame !== null) {
+			return;
+		}
+		const win = this.containerEl.win;
+		const handle = win.requestAnimationFrame(() => {
+			this.renderFrame = null;
+			this.renderStatus();
+			this.renderFailureReport();
+			this.renderChangeReports();
+			this.renderFeed();
+		});
+		this.renderFrame = { win, handle };
+	}
+
+	private isBusy(): boolean {
+		return (
+			this.host.isRunning() ||
+			this.followUpSending ||
+			this.host.isFollowUpRunning()
+		);
+	}
+
 	private renderShell(): void {
 		const root = this.contentEl;
 		root.empty();
+		this.renderedSourcesKey = null;
+		this.renderedFailure = undefined;
+		this.renderedReports = null;
+		this.renderedFilter = null;
+		this.feedRows.clear();
+		this.feedEmptyEl = null;
 		root.addClass('voice-journal-activity');
 
 		const header = root.createDiv({ cls: 'voice-journal-activity__header' });
@@ -268,12 +365,12 @@ export class VoiceJournalActivityView extends ItemView {
 				input.value = '';
 			}
 		});
-		const clearButton = actions.createEl('button', {
+		this.clearButton = actions.createEl('button', {
 			attr: { 'aria-label': 'Clear the visible activity' },
 		});
-		setIcon(clearButton, 'list-x');
-		clearButton.addEventListener('click', () => {
-			void this.host.activity.clearView();
+		setIcon(this.clearButton, 'list-x');
+		this.clearButton.addEventListener('click', () => {
+			void this.clearActivity();
 		});
 		const settingsButton = actions.createEl('button', {
 			attr: { 'aria-label': 'Open voice journal settings' },
@@ -315,6 +412,7 @@ export class VoiceJournalActivityView extends ItemView {
 			const button = filters.createEl('button', {
 				text: filterLabel(filter),
 				cls: 'voice-journal-activity__filter',
+				attr: { 'aria-pressed': (this.filter === filter).toString() },
 			});
 			button.toggleClass('is-active', this.filter === filter);
 			button.addEventListener('click', () => {
@@ -323,6 +421,10 @@ export class VoiceJournalActivityView extends ItemView {
 					filters.querySelectorAll('button'),
 				)) {
 					candidate.toggleClass('is-active', candidate === button);
+					candidate.setAttribute(
+						'aria-pressed',
+						(candidate === button).toString(),
+					);
 				}
 				this.renderFeed();
 			});
@@ -406,6 +508,13 @@ export class VoiceJournalActivityView extends ItemView {
 			return;
 		}
 		const sources = this.host.getRecordingSources();
+		const key = sources
+			.map((source) => `${source.name}\0${source.path}`)
+			.join('\n');
+		if (key === this.renderedSourcesKey) {
+			return;
+		}
+		this.renderedSourcesKey = key;
 		container.empty();
 		if (sources.length === 0) {
 			return;
@@ -447,9 +556,21 @@ export class VoiceJournalActivityView extends ItemView {
 		if (container === null) {
 			return;
 		}
-		const failure = [...this.events].reverse().find(
-			(event) => event.kind === 'run' && event.level === 'error',
-		);
+		let failure: ActivityEvent | undefined;
+		for (let index = this.events.length - 1; index >= 0; index -= 1) {
+			const event = this.events[index];
+			if (event?.kind === 'run' && event.level === 'error') {
+				failure = event;
+				break;
+			}
+		}
+		if (
+			this.renderedFailure !== undefined &&
+			this.renderedFailure === (failure ?? null)
+		) {
+			return;
+		}
+		this.renderedFailure = failure ?? null;
 		container.empty();
 		container.hidden = failure === undefined;
 		if (failure === undefined) {
@@ -552,6 +673,7 @@ export class VoiceJournalActivityView extends ItemView {
 		const containerEl = parent.createDiv({
 			cls: 'voice-journal-activity__service is-checking',
 			attr: {
+				role: 'img',
 				'aria-label': `${label} availability has not been checked yet.`,
 			},
 		});
@@ -580,9 +702,16 @@ export class VoiceJournalActivityView extends ItemView {
 	}
 
 	private async refreshServiceHealth(): Promise<void> {
-		if (this.healthCheckPending || this.host.isRunning()) {
+		if (this.healthCheckPending) {
 			return;
 		}
+		// Checking runs the agent CLI; don't compete with an active run or
+		// spend work while the panel isn't visible. Retry once that changes.
+		if (this.isBusy() || !this.contentEl.isShown()) {
+			this.healthCheckStale = true;
+			return;
+		}
+		this.healthCheckStale = false;
 		this.healthCheckPending = true;
 		const generation = ++this.healthCheckGeneration;
 		this.updateServiceIndicator(
@@ -695,6 +824,44 @@ export class VoiceJournalActivityView extends ItemView {
 			);
 			this.runButton.toggleClass('is-stop', running);
 		}
+		if (this.clearButton !== null) {
+			const busy = this.isBusy();
+			this.clearButton.disabled = busy;
+			this.clearButton.setAttribute(
+				'aria-label',
+				busy
+					? 'Clearing is unavailable while the agent is working'
+					: 'Clear the visible activity',
+			);
+		}
+	}
+
+	private changeReports(): ActivityEvent[] {
+		return this.events.filter(
+			(event) => event.kind === 'changes' && (event.changes?.length ?? 0) > 0,
+		);
+	}
+
+	private async clearActivity(): Promise<void> {
+		if (this.isBusy()) {
+			new Notice('Wait for the voice journal run to finish.');
+			return;
+		}
+		const pending = this.changeReports()
+			.flatMap((report) => report.changes ?? [])
+			.filter((change) => change.reverted !== true).length;
+		if (pending > 0) {
+			const confirmed = await this.confirm(
+				'Clear activity?',
+				`${pending.toString()} vault change${pending === 1 ? ' has' : 's have'} not been reverted. Clearing keeps them in your vault but removes the option to review or revert them here.`,
+				'Clear',
+			);
+			if (!confirmed || this.isBusy()) {
+				return;
+			}
+		}
+		await this.host.activity.clearView();
+		this.expandedDetails.clear();
 	}
 
 	private renderChangeReports(): void {
@@ -702,9 +869,20 @@ export class VoiceJournalActivityView extends ItemView {
 		if (container === null) {
 			return;
 		}
-		const reports = this.events.filter(
-			(event) => event.kind === 'changes' && (event.changes?.length ?? 0) > 0,
-		);
+		const reports = this.changeReports();
+		const busy = this.isBusy();
+		// Change reports (with diffs) are expensive and hold user selection and
+		// the follow-up draft; rebuild only when a report or the busy state changed.
+		if (
+			this.renderedReports !== null &&
+			busy === this.renderedReportsBusy &&
+			reports.length === this.renderedReports.length &&
+			reports.every((report, index) => report === this.renderedReports?.[index])
+		) {
+			return;
+		}
+		this.renderedReports = reports;
+		this.renderedReportsBusy = busy;
 		// Capture the follow-up composer's live value/focus before the rebuild
 		// below tears it down, so an in-progress agent run streaming activity
 		// events doesn't wipe out what the user is typing.
@@ -729,8 +907,6 @@ export class VoiceJournalActivityView extends ItemView {
 			cls: 'voice-journal-activity__changes-count',
 			text: `${changedCount.toString()} file change${changedCount === 1 ? '' : 's'}`,
 		});
-		const busy =
-			this.host.isRunning() || this.followUpSending || this.host.isFollowUpRunning();
 		const accept = header.createEl('button', {
 			cls: 'voice-journal-activity__accept-changes mod-cta',
 			text: 'Accept changes',
@@ -784,7 +960,7 @@ export class VoiceJournalActivityView extends ItemView {
 			cls: 'voice-journal-activity__follow-up-input',
 			attr: {
 				placeholder:
-					'Ask the agent for changes before accepting — e.g. "move this under the poncle note instead"…',
+					'Ask the agent for changes before accepting — e.g. "link this to the existing project note instead"…',
 				rows: '2',
 			},
 		});
@@ -799,18 +975,24 @@ export class VoiceJournalActivityView extends ItemView {
 				return;
 			}
 			this.followUpSending = true;
+			this.renderStatus();
 			textarea.disabled = true;
 			send.disabled = true;
 			send.setText('Sending…');
 			this.host
 				.sendFollowUpMessage(message)
 				.then(() => {
-					textarea.value = '';
+					// The composer may have been rebuilt while sending.
+					if (this.followUpTextarea !== null) {
+						this.followUpTextarea.value = '';
+					}
 				})
 				.catch(() => undefined)
 				.finally(() => {
 					this.followUpSending = false;
+					this.renderedReports = null;
 					this.renderChangeReports();
+					this.renderStatus();
 				});
 		};
 		textarea.disabled = busy;
@@ -841,47 +1023,94 @@ export class VoiceJournalActivityView extends ItemView {
 		}
 	}
 
+	private isFeedEvent(event: ActivityEvent): boolean {
+		return (
+			event.kind !== 'changes' &&
+			!(event.kind === 'run' && event.level === 'error') &&
+			(this.filter === 'all' ||
+				event.kind === this.filter ||
+				(this.filter === 'pipeline' && event.kind === 'run'))
+		);
+	}
+
+	/**
+	 * Reconciles the feed with the current events: rows whose event object is
+	 * unchanged are kept (preserving selection and scroll), replaced events
+	 * (same id via replaceKey) are rebuilt in place, and new ones appended.
+	 */
 	private renderFeed(): void {
 		const feed = this.feedEl;
 		if (feed === null) {
 			return;
 		}
-		feed.empty();
-		const visible = this.events.filter(
-			(event) =>
-				event.kind !== 'changes' &&
-				!(event.kind === 'run' && event.level === 'error') &&
-				(this.filter === 'all' ||
-					event.kind === this.filter ||
-					(this.filter === 'pipeline' && event.kind === 'run')),
-		);
+		if (this.renderedFilter !== this.filter) {
+			feed.empty();
+			this.feedRows.clear();
+			this.feedEmptyEl = null;
+			this.renderedFilter = this.filter;
+		}
+		const visible = this.events.filter((event) => this.isFeedEvent(event));
+		const visibleIds = new Set(visible.map((event) => event.id));
+		for (const [id, row] of this.feedRows) {
+			if (!visibleIds.has(id)) {
+				row.el.remove();
+				this.feedRows.delete(id);
+			}
+		}
 		if (visible.length === 0) {
-			feed.createDiv({
+			this.feedEmptyEl ??= feed.createDiv({
 				cls: 'voice-journal-activity__empty',
 				text: 'No activity to show yet.',
 			});
 			return;
 		}
+		this.feedEmptyEl?.remove();
+		this.feedEmptyEl = null;
 
+		let changed = false;
+		let previous: HTMLElement | null = null;
 		for (const event of visible) {
-			this.renderEvent(feed, event);
+			const existing = this.feedRows.get(event.id);
+			let el: HTMLElement;
+			if (existing === undefined) {
+				el = this.renderEvent(feed, event);
+				changed = true;
+			} else if (existing.event !== event) {
+				el = this.renderEvent(feed, event);
+				existing.el.replaceWith(el);
+				changed = true;
+			} else {
+				el = existing.el;
+			}
+			this.feedRows.set(event.id, { event, el });
+			const expected: ChildNode | null =
+				previous === null ? feed.firstChild : previous.nextSibling;
+			if (expected !== el) {
+				if (previous === null) {
+					feed.prepend(el);
+				} else {
+					previous.after(el);
+				}
+			}
+			previous = el;
 		}
-		if (this.pinnedToBottom) {
-			window.requestAnimationFrame(() => {
+		if (changed && this.pinnedToBottom) {
+			feed.win.requestAnimationFrame(() => {
 				feed.scrollTop = feed.scrollHeight;
 			});
 		}
 	}
 
-	private renderEvent(parent: HTMLElement, event: ActivityEvent): void {
+	private renderEvent(parent: HTMLElement, event: ActivityEvent): HTMLElement {
 		const row = parent.createDiv({
 			cls: `voice-journal-activity__event is-${event.kind} is-${event.level}`,
 		});
 		if (event.kind === 'agent') {
 			this.renderAgentEvent(row, event);
-			return;
+		} else {
+			this.renderCompactEvent(row, event);
 		}
-		this.renderCompactEvent(row, event);
+		return row;
 	}
 
 	private renderChangeReport(
@@ -922,9 +1151,10 @@ export class VoiceJournalActivityView extends ItemView {
 		});
 		revertAll.disabled = pending.length === 0 || busy;
 		revertAll.addEventListener('click', () => {
-			void this.confirmRevert(
+			void this.confirm(
 				'Revert all vault changes?',
 				`This will restore ${pending.length.toString()} file${pending.length === 1 ? '' : 's'} to their state before this agent run.`,
+				'Revert',
 			).then(async (confirmed) => {
 				if (confirmed) {
 					await this.host.revertAllFileChanges(event.id);
@@ -958,7 +1188,12 @@ export class VoiceJournalActivityView extends ItemView {
 		const summary = row.createDiv({
 			cls: 'voice-journal-activity__change-summary',
 		});
-		const icon = summary.createSpan({
+		// The toggle holds only the file label, so the Open/Revert buttons are
+		// never nested inside an element with role="button".
+		const toggle = summary.createDiv({
+			cls: 'voice-journal-activity__change-toggle',
+		});
+		const icon = toggle.createSpan({
 			cls: 'voice-journal-activity__agent-icon',
 		});
 		setIcon(
@@ -971,11 +1206,11 @@ export class VoiceJournalActivityView extends ItemView {
 						? 'file-x-2'
 						: 'file-pen-line',
 		);
-		summary.createSpan({
+		toggle.createSpan({
 			cls: 'voice-journal-activity__change-path',
 			text: change.path,
 		});
-		summary.createSpan({
+		toggle.createSpan({
 			cls: 'voice-journal-activity__change-kind',
 			text: change.reverted === true ? 'reverted' : change.kind,
 		});
@@ -984,7 +1219,7 @@ export class VoiceJournalActivityView extends ItemView {
 		});
 		if (change.kind !== 'deleted') {
 			const open = actions.createEl('button', {
-				cls: 'voice-journal-activity__change-action',
+				cls: 'voice-journal-activity__change-action clickable-icon',
 				attr: { 'aria-label': `Open ${change.path}` },
 			});
 			setIcon(open, 'external-link');
@@ -995,16 +1230,17 @@ export class VoiceJournalActivityView extends ItemView {
 			});
 		}
 		const revert = actions.createEl('button', {
-			cls: 'voice-journal-activity__change-action',
+			cls: 'voice-journal-activity__change-action clickable-icon',
 			attr: { 'aria-label': `Revert ${change.path}` },
 		});
 		setIcon(revert, 'undo-2');
 		revert.disabled = change.reverted === true || busy;
 		revert.addEventListener('click', (clickEvent) => {
 			clickEvent.stopPropagation();
-			void this.confirmRevert(
+			void this.confirm(
 				'Revert this file?',
 				`Restore ${change.path} to its state before this agent run?`,
+				'Revert',
 			).then(async (confirmed) => {
 				if (confirmed) {
 					await this.host.revertFileChange(eventId, change.path);
@@ -1023,16 +1259,23 @@ export class VoiceJournalActivityView extends ItemView {
 				});
 			}
 			details.hidden = !this.expandedDetails.has(detailId);
-			this.makeExpandable(summary, detailId, details);
+			this.makeExpandable(toggle, detailId, details);
 		}
 	}
 
-	private async confirmRevert(
+	private async confirm(
 		heading: string,
 		message: string,
+		confirmText: string,
 	): Promise<boolean> {
 		return await new Promise((resolve) => {
-			new RevertConfirmationModal(this.app, heading, message, resolve).open();
+			new ConfirmationModal(
+				this.app,
+				heading,
+				message,
+				confirmText,
+				resolve,
+			).open();
 		});
 	}
 
@@ -1077,7 +1320,7 @@ export class VoiceJournalActivityView extends ItemView {
 				text: event.detail,
 			});
 			detailsContent.hidden = !this.expandedDetails.has(event.id);
-			this.makeExpandable(parent, event.id, detailsContent);
+			this.makeExpandable(summary, event.id, detailsContent);
 		}
 	}
 
@@ -1191,7 +1434,7 @@ export class VoiceJournalActivityView extends ItemView {
 				text: event.detail,
 			});
 			detailsContent.hidden = !this.expandedDetails.has(event.id);
-			this.makeExpandable(parent, event.id, detailsContent);
+			this.makeExpandable(summary, event.id, detailsContent);
 		}
 	}
 
@@ -1220,37 +1463,53 @@ export class VoiceJournalActivityView extends ItemView {
 		}
 	}
 
+	/**
+	 * Makes a dedicated summary element (never one containing other buttons)
+	 * toggle its details. The details themselves are not part of the toggle,
+	 * so clicking or selecting text inside an expanded <pre> keeps it open.
+	 */
 	private makeExpandable(
-		target: HTMLElement,
-		eventId: string,
+		toggleEl: HTMLElement,
+		detailId: string,
 		details: HTMLElement,
 	): void {
-		target.addClass('is-expandable');
-		target.tabIndex = 0;
-		target.setAttribute('role', 'button');
-		target.setAttribute(
+		toggleEl.addClass('is-expandable');
+		toggleEl.tabIndex = 0;
+		toggleEl.setAttribute('role', 'button');
+		toggleEl.setAttribute(
 			'aria-expanded',
-			this.expandedDetails.has(eventId) ? 'true' : 'false',
+			this.expandedDetails.has(detailId) ? 'true' : 'false',
 		);
 		const toggle = (): void => {
-			const expanded = !this.expandedDetails.has(eventId);
+			const expanded = !this.expandedDetails.has(detailId);
 			if (expanded) {
-				this.expandedDetails.add(eventId);
+				this.expandedDetails.add(detailId);
 			} else {
-				this.expandedDetails.delete(eventId);
+				this.expandedDetails.delete(detailId);
 			}
-			target.setAttribute('aria-expanded', expanded.toString());
+			toggleEl.setAttribute('aria-expanded', expanded.toString());
 			details.hidden = !expanded;
 		};
-		target.addEventListener('click', (event) => {
+		toggleEl.addEventListener('click', (event) => {
 			const clicked = event.target;
-			if (!(clicked instanceof Element) || clicked.closest('button') === null) {
-				toggle();
+			if (clicked instanceof Element && clicked.closest('button') !== null) {
+				return;
 			}
-		});
-		target.addEventListener('keydown', (event) => {
+			// Finishing a text selection on the summary is not a toggle.
+			const selection = toggleEl.win.getSelection();
 			if (
-				event.target === target &&
+				selection !== null &&
+				!selection.isCollapsed &&
+				selection.anchorNode !== null &&
+				toggleEl.contains(selection.anchorNode)
+			) {
+				return;
+			}
+			toggle();
+		});
+		toggleEl.addEventListener('keydown', (event) => {
+			if (
+				event.target === toggleEl &&
 				(event.key === 'Enter' || event.key === ' ')
 			) {
 				event.preventDefault();
@@ -1258,5 +1517,4 @@ export class VoiceJournalActivityView extends ItemView {
 			}
 		});
 	}
-
 }

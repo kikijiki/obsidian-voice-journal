@@ -7,7 +7,11 @@
 export const STT_MAX_CHUNK_BYTES = 20 * 1024 * 1024;
 export const STT_MAX_CHUNK_SECONDS = 300;
 
-const MIN_CHUNK_SECONDS = 10;
+// Chunks are planned against a fraction of the byte limit: segments are cut
+// on packet boundaries, variable-bitrate audio is denser in some stretches
+// than the file average, and each chunk repeats the container header.
+const CHUNK_SIZE_SAFETY_FACTOR = 0.9;
+const MIN_CHUNK_SECONDS = 1;
 
 export function planChunkSeconds(
 	sizeBytes: number,
@@ -25,9 +29,15 @@ export function planChunkSeconds(
 		return null;
 	}
 	const bytesPerSecond = sizeBytes / durationSeconds;
-	const secondsBySize = Math.floor(STT_MAX_CHUNK_BYTES / bytesPerSecond);
-	return Math.max(
-		MIN_CHUNK_SECONDS,
-		Math.min(STT_MAX_CHUNK_SECONDS, secondsBySize),
+	const secondsBySize = Math.floor(
+		(STT_MAX_CHUNK_BYTES * CHUNK_SIZE_SAFETY_FACTOR) / bytesPerSecond,
 	);
+	// A floor must never override the size limit; only when even a single
+	// second would not fit is splitting hopeless.
+	if (secondsBySize < MIN_CHUNK_SECONDS) {
+		throw new Error(
+			'The recording bitrate is too high to split it into chunks that fit the speech-to-text upload limit.',
+		);
+	}
+	return Math.min(STT_MAX_CHUNK_SECONDS, secondsBySize);
 }

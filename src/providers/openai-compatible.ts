@@ -18,8 +18,12 @@ export function normalizeApiBaseUrl(value: string): string {
 	if (url.username !== '' || url.password !== '') {
 		throw new Error('Put credentials in authentication settings, not the URL.');
 	}
+	if (url.search !== '') {
+		// Paths are appended to the base URL, so a query string would end up in
+		// the middle of the request URL; reject it instead of dropping it silently.
+		throw new Error('Provider URL must not contain a query string.');
+	}
 	url.hash = '';
-	url.search = '';
 	url.pathname = url.pathname.replace(/\/+$/, '');
 	return url.toString().replace(/\/$/, '');
 }

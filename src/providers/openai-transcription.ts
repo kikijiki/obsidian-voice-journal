@@ -1,5 +1,6 @@
 import type { RequestUrlParam, RequestUrlResponse } from 'obsidian';
 import { normalizeApiBaseUrl, buildAuthHeaders } from './openai-compatible';
+import { setTimeout as wait } from 'node:timers/promises';
 import { withTimeout } from './timeout';
 
 export type TranscriptionRequestUrl = (
@@ -194,10 +195,14 @@ function parseTranscriptionResponse(value: unknown): TranscriptionResult {
 	};
 }
 
+/** Statuses worth retrying: rate limits and gateway hiccups, not client errors. */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
 export class OpenAiTranscriptionProvider {
 	constructor(
 		private readonly requester: TranscriptionRequestUrl,
 		private readonly timeoutMs = 600_000,
+		private readonly retryDelaysMs: readonly number[] = [2_000, 10_000],
 	) {}
 
 	async transcribe(
@@ -209,18 +214,27 @@ export class OpenAiTranscriptionProvider {
 				? buildTranscriptionJsonBody(input)
 				: buildTranscriptionMultipart(input);
 		const headers = buildAuthHeaders(input.apiKey ?? '');
-		const response = await withTimeout(
-			this.requester({
-				url: `${normalizeApiBaseUrl(baseUrl)}/audio/transcriptions`,
-				method: 'POST',
-				contentType: request.contentType,
-				body: request.body,
-				throw: false,
-				...(headers === undefined ? {} : { headers }),
-			}),
-			this.timeoutMs,
-			'Transcription request',
-		);
+		const send = async (): Promise<RequestUrlResponse> =>
+			await withTimeout(
+				this.requester({
+					url: `${normalizeApiBaseUrl(baseUrl)}/audio/transcriptions`,
+					method: 'POST',
+					contentType: request.contentType,
+					body: request.body,
+					throw: false,
+					...(headers === undefined ? {} : { headers }),
+				}),
+				this.timeoutMs,
+				'Transcription request',
+			);
+		let response = await send();
+		for (const delayMs of this.retryDelaysMs) {
+			if (!RETRYABLE_STATUSES.has(response.status)) {
+				break;
+			}
+			await wait(delayMs);
+			response = await send();
+		}
 		if (response.status < 200 || response.status >= 300) {
 			throw new Error(`Transcription failed: ${transcriptionError(response)}.`);
 		}

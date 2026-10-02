@@ -148,7 +148,7 @@ describe('PipelineCoordinator', () => {
 	it('matches recordings by file name, size, and modification time', async () => {
 		const known: RecordingState = {
 			hash: 'b'.repeat(64),
-			stage: 'complete',
+			stage: 'transcribed',
 			sourcePath: '/old/mount/long.wav',
 			fileName: 'long.wav',
 			size: 10,
@@ -292,7 +292,7 @@ describe('PipelineCoordinator', () => {
 		expect(groupRecordingCandidates(recordings, 'none')).toHaveLength(5);
 	});
 
-	it('stops after the first recording failure and reports its source', async () => {
+	it('continues past a failed recording and reports its source', async () => {
 		const runtime: RuntimeState = { lastRun: null, recordings: {} };
 		const progress: PipelineProgress[] = [];
 		const saved: RuntimeState[] = [];
@@ -351,11 +351,11 @@ describe('PipelineCoordinator', () => {
 
 		const result = await coordinator.run('scan-and-process', 'command');
 
-		expect(processBatch).toHaveBeenCalledTimes(1);
+		expect(processBatch).toHaveBeenCalledTimes(2);
 		expect(result.summary).toMatchObject({
 			status: 'failed',
 			candidateCount: 2,
-			processedCount: 0,
+			processedCount: 1,
 			processingFailureCount: 1,
 			scanErrorCount: 0,
 			warningCount: 1,
@@ -375,9 +375,14 @@ describe('PipelineCoordinator', () => {
 		expect(progress.at(-1)?.stage).toBe('failed');
 	});
 
-	it('does not process partial scan results when a source scan fails', async () => {
+	it('processes valid recordings even when a source scan fails', async () => {
 		const runtime: RuntimeState = { lastRun: null, recordings: {} };
-		const processBatch = vi.fn();
+		const processBatch = vi.fn(async (inputs: ProcessRecordingInput[]) =>
+			inputs.map((input) => ({
+				candidate: input.candidate,
+				result: 'processed' as const,
+			})),
+		);
 		const coordinator = new PipelineCoordinator({
 			getSettings: () => structuredClone(DEFAULT_SETTINGS),
 			getRuntime: () => runtime,
@@ -417,12 +422,167 @@ describe('PipelineCoordinator', () => {
 
 		const result = await coordinator.run('scan-and-process', 'command');
 
-		expect(processBatch).not.toHaveBeenCalled();
+		expect(processBatch).toHaveBeenCalledTimes(1);
 		expect(result.summary).toMatchObject({
 			status: 'failed',
 			scanErrorCount: 1,
-			processedCount: 0,
+			processedCount: 1,
 		});
-		expect(result.summary.message).toContain('Stopped before processing');
+	});
+
+	function testCoordinator(input: {
+		candidates: AudioCandidate[];
+		runtime?: RuntimeState;
+		processBatch: (inputs: ProcessRecordingInput[]) => Promise<
+			Array<{
+				candidate: AudioCandidate;
+				result: 'processed' | 'skipped' | 'failed';
+				error?: Error;
+			}>
+		>;
+		checkHealth?: () => Promise<{ baseUrl: string; ok: boolean; latencyMs: number; models: string[]; error?: string }>;
+	}): PipelineCoordinator {
+		const runtime = input.runtime ?? { lastRun: null, recordings: {} };
+		return new PipelineCoordinator({
+			getSettings: () => ({
+				...structuredClone(DEFAULT_SETTINGS),
+				recordingGrouping: 'none',
+			}),
+			getRuntime: () => runtime,
+			getVaultRoot: () => '/vault',
+			getArtifactRoot: () => '/nonexistent/voice-journal-test/.voice-journal',
+			saveRuntime: async () => undefined,
+			reportProgress: () => undefined,
+			scanner: {
+				scan: async () => ({
+					candidates: input.candidates,
+					errors: [],
+					warnings: [],
+				}),
+				scanPaths: async () => ({ candidates: [], errors: [], warnings: [] }),
+			},
+			provider: {
+				checkHealth:
+					input.checkHealth ??
+					(async () => ({
+						baseUrl: '',
+						ok: true,
+						latencyMs: 1,
+						models: [],
+					})),
+				listModels: async () => [],
+			},
+			agent: {
+				checkHealth: async (type) => ({ type, ok: true, latencyMs: 1 }),
+				listModels: async () => [],
+			},
+			processor: { processBatch: input.processBatch },
+		});
+	}
+
+	function state(overrides: Partial<RecordingState>): RecordingState {
+		return {
+			hash: 'c'.repeat(64),
+			stage: 'complete',
+			sourcePath: '/source/done.wav',
+			fileName: 'done.wav',
+			size: 10,
+			sourceModifiedAtMs: 1,
+			attempts: 1,
+			updatedAt: '2026-09-23T00:00:00.000Z',
+			...overrides,
+		};
+	}
+
+	it('skips finished recordings without checking services', async () => {
+		const done = state({});
+		const failed = state({
+			hash: 'd'.repeat(64),
+			stage: 'failed',
+			sourcePath: '/source/bad.wav',
+			fileName: 'bad.wav',
+		});
+		const processBatch = vi.fn(async () => []);
+		const checkHealth = vi.fn(async () => ({
+			baseUrl: '',
+			ok: false,
+			latencyMs: 1,
+			models: [],
+			error: 'offline',
+		}));
+		const result = await testCoordinator({
+			candidates: [candidate('done.wav'), candidate('bad.wav')],
+			runtime: {
+				lastRun: null,
+				recordings: { [done.hash]: done, [failed.hash]: failed },
+			},
+			processBatch,
+			checkHealth,
+		}).run('scan-and-process', 'command');
+
+		expect(processBatch).not.toHaveBeenCalled();
+		expect(checkHealth).not.toHaveBeenCalled();
+		expect(result.summary).toMatchObject({ status: 'succeeded', skippedCount: 2 });
+		expect(result.summary.message).toContain('1 recording(s) are marked as failed');
+	});
+
+	it('stops after three consecutive failed groups', async () => {
+		const processBatch = vi.fn(async (inputs: ProcessRecordingInput[]) =>
+			inputs.map((input) => ({
+				candidate: input.candidate,
+				result: 'failed' as const,
+				error: new Error('STT is down.'),
+			})),
+		);
+		const result = await testCoordinator({
+			candidates: ['a', 'b', 'c', 'd', 'e'].map((name) => ({
+				...candidate(`${name}.wav`),
+				recordedAtMs: name.charCodeAt(0),
+			})),
+			processBatch,
+		}).run('scan-and-process', 'command');
+
+		expect(processBatch).toHaveBeenCalledTimes(3);
+		expect(result.summary.processingFailureCount).toBe(3);
+		expect(result.summary.issues.at(-1)?.message).toContain('consecutive failed groups');
+	});
+
+	it('resumes unfinished recordings whose source is gone', async () => {
+		const orphan = state({
+			hash: 'e'.repeat(64),
+			stage: 'transcribed',
+			sourcePath: '/unmounted/voice.wav',
+			fileName: 'voice.wav',
+			transcriptPath: 'x/raw-transcript.txt',
+			recordedAtMs: 42,
+		});
+		const lost = state({
+			hash: 'f'.repeat(64),
+			stage: 'discovered',
+			sourcePath: '/unmounted/lost.wav',
+			fileName: 'lost.wav',
+		});
+		let captured: ProcessRecordingInput[] = [];
+		await testCoordinator({
+			candidates: [],
+			runtime: {
+				lastRun: null,
+				recordings: { [orphan.hash]: orphan, [lost.hash]: lost },
+			},
+			processBatch: async (inputs) => {
+				captured = inputs;
+				return inputs.map((input) => ({
+					candidate: input.candidate,
+					result: 'processed' as const,
+				}));
+			},
+		}).run('scan-and-process', 'command');
+
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.knownHash).toBe(orphan.hash);
+		expect(captured[0]?.candidate).toMatchObject({
+			absolutePath: '/unmounted/voice.wav',
+			recordedAtMs: 42,
+		});
 	});
 });

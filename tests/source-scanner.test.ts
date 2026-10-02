@@ -253,4 +253,32 @@ describe('SourceScanner.scanPaths', () => {
 		expect(result.errors).toHaveLength(2);
 		expect(result.errors[1]?.message).toMatch(/absolute/i);
 	});
+
+	it('uses the containing source timestamp rules for a manual pick', async () => {
+		const root = await createFixtureRoot();
+		const recording = join(root, 'TX01_MIC001_20260921_190443_orig.wav');
+		await writeFile(recording, 'audio');
+
+		const result = await new SourceScanner().scanPaths(
+			[recording],
+			[
+				{
+					id: 'dji',
+					name: 'DJI',
+					path: root,
+					recursive: true,
+					extensions: ['.wav'],
+					minimumAgeSeconds: 0,
+					timestampSource: 'filename',
+					filenameTimestampRegex: DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX,
+					timestampOffsetHours: 1,
+				},
+			],
+		);
+
+		expect(result.candidates[0]).toMatchObject({
+			sourceId: 'dji',
+			recordedAtMs: new Date(2026, 8, 21, 20, 4, 43).valueOf(),
+		});
+	});
 });

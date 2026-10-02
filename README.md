@@ -8,7 +8,7 @@ The plugin does the mechanical work: it scans recording sources, waits for a sta
 
 - Obsidian 1.13.0 or newer, on desktop.
 - A speech-to-text service exposing the OpenAI-compatible `/audio/transcriptions` API.
-- One of Pi, Claude Code, Codex, or Cursor installed and configured.
+- One of Pi, Claude Code, or Codex installed and configured.
 
 ## Install
 
@@ -26,6 +26,8 @@ The plugin has not been submitted to the community plugin directory yet, so inst
 
 The plugin copies each stable recording, transcribes it, and invokes the agent once per group. The activity panel opens automatically and shows progress, full transcripts, agent output, and a diff of every changed note. Each file, or the whole report, can be reverted. Completed recordings are never processed again.
 
+A recording that cannot succeed (an empty file or an empty transcript) or that fails five times is marked as failed and skipped by later runs; drop it onto the activity panel to retry it. A failure never blocks newer recordings: the run moves on to the next group, and stops only after three groups fail in a row. Unfinished recordings whose source file has disappeared are finished from the plugin cache.
+
 ## Settings
 
 ### Recording sources
@@ -38,11 +40,11 @@ Each source is an absolute path outside the vault, such as mounted microphone st
 
 ### Journal directory
 
-The single vault-structure setting. It tells the agent where the journal is. It does not stop the agent from reading or updating other notes the recording refers to. There are no settings for people, topics, projects, books, or provenance; the agent learns those conventions from the vault.
+The single vault-structure setting. It tells the agent where the journal is. It does not stop the agent from reading or updating other notes the recording refers to. The recording time is a hint: the agent may place content in another day's entry, for example a recording made after midnight about the previous day, or one that talks about last weekend. There are no settings for people, topics, projects, books, or provenance; the agent learns those conventions from the vault.
 
 ### Coding agent
 
-- `codingAgentType`: `pi`, `claude`, `codex`, or `cursor`.
+- `codingAgentType`: `pi`, `claude`, or `codex`.
 - `codingAgentExecutable`: executable name or absolute path.
 - `codingAgentModel`: optional model ID understood by that CLI.
 - `codingAgentThinkingEnabled`: Pi's native `high` thinking level. Off by default.
@@ -57,7 +59,7 @@ The CLI owns the model endpoint and credentials through its own configuration.
 
 - `sttProvider`: `custom` (any OpenAI-compatible endpoint) or `openrouter`. OpenRouter uses a fixed endpoint, sends audio as base64 JSON, and lists ASR-capable models for your API key.
 - `sttBaseUrl`: the endpoint for a custom provider.
-- `sttApiKey`: optional, sent as a bearer token.
+- `sttApiKey`: optional, sent as a bearer token. Stored in Obsidian's secret storage, not in `data.json`.
 - `sttModel`: the model ID the service serves. The settings tab lists the models the endpoint reports.
 - `sttSplitLongRecordings`: on by default. Recordings over about 20 MB or 5 minutes are split with ffmpeg into parts sized to fit OpenRouter's request limits, transcribed separately, and stitched together. The same limits apply to local servers.
 - `ffmpegExecutable`: executable name or absolute path, used to read durations and split recordings.
@@ -70,7 +72,7 @@ The plugin copies each recording into its cache so an interrupted run can resume
 
 ## What it writes
 
-- A journal entry in the configured journal directory, with provenance in a `voice_journal_sources` YAML list of `sha256:<hash>` values and `date` on newly created daily notes. HTML provenance comments are never used.
+- Journal entries in the configured journal directory. Notes contain no provenance markers; the plugin records, per recording, its content hash, recording time, and the notes the agent changed in its own `data.json`.
 - When **Add new entries** or **Update existing entries** is enabled, notes outside the journal that the recording refers to. With both off, the agent edits only the journal entry.
 - Raw transcripts and STT responses in the plugin's own `.voice-journal` cache.
 
@@ -80,6 +82,7 @@ The activity panel snapshots Markdown notes around each agent call and shows a d
 
 - Audio is sent only to the speech-to-text endpoint configured in the plugin settings.
 - Transcripts are sent to whatever model the selected coding agent CLI is configured to use.
+- The agent is restricted to file tools: Claude Code runs without shell, web, or MCP tools, and Codex runs in its workspace-write sandbox without network access.
 - There is no telemetry, and no cloud fallback.
 - Activity logs are session-only and stored in the plugin-local ignored cache.
 

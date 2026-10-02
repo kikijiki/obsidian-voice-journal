@@ -1,4 +1,9 @@
-import { FileSystemAdapter, Notice, Plugin, requestUrl } from 'obsidian';
+import {
+	FileSystemAdapter,
+	Notice,
+	Plugin,
+	requestUrl,
+} from 'obsidian';
 import { CodingAgentClient, codingAgentName } from './agents/coding-agent';
 import { registerCommands } from './commands/register';
 import type {
@@ -43,7 +48,9 @@ interface AppWithSettings {
 	};
 }
 
-const HIDE_SOURCES_PROPERTY_CLASS = 'voice-journal-hide-sources-property';
+// The STT key lives in Obsidian's secret storage instead of data.json, which
+// is often synced or committed with the vault.
+const STT_API_KEY_SECRET_ID = 'kikijiki-voice-journal-stt-api-key';
 
 export default class VoiceJournalPlugin extends Plugin {
 	settings!: VoiceJournalSettings;
@@ -52,35 +59,39 @@ export default class VoiceJournalPlugin extends Plugin {
 	private coordinator!: PipelineCoordinator;
 	private processor!: RecordingProcessor;
 	private agent: CodingAgentClient | null = null;
+	/**
+	 * Set synchronously when a pipeline run is requested, before any await, so
+	 * two quick triggers cannot both pass the busy check.
+	 */
+	private runActive = false;
 	private followUpRunning = false;
+	private revertRunning = false;
+	/** Notes edited in an Obsidian editor while the agent was running. */
+	private readonly editedDuringAgent = new Set<string>();
 	private statusBarItem!: HTMLElement;
 	private progressNotice: Notice | null = null;
 	private currentProgress: PipelineProgress | null = null;
 	private readonly activity = new ActivityLog();
-	private readonly styledWindows = new Set<Window>();
 
 	async onload(): Promise<void> {
-		this.data = parsePluginData(await this.loadData());
+		const loaded: unknown = await this.loadData();
+		this.data = parsePluginData(loaded);
 		this.settings = this.data.settings;
 		this.runtime = this.data.runtime;
-		this.trackWindowForStyling(window);
+		await this.loadSttApiKey(loaded);
 		this.registerEvent(
-			this.app.workspace.on('window-open', (_workspaceWindow, popout) => {
-				this.trackWindowForStyling(popout);
+			this.app.workspace.on('editor-change', (_editor, info) => {
+				if ((this.runActive || this.followUpRunning) && info.file !== null) {
+					this.editedDuringAgent.add(info.file.path);
+				}
 			}),
 		);
-		this.registerEvent(
-			this.app.workspace.on('window-close', (_workspaceWindow, popout) => {
-				this.styledWindows.delete(popout);
-			}),
-		);
-		this.register(() => {
-			for (const target of this.styledWindows) {
-				target.document.body.classList.remove(HIDE_SOURCES_PROPERTY_CLASS);
-			}
-			this.styledWindows.clear();
-		});
 		await initializeArtifactStorage(this.getArtifactRoot());
+		try {
+			await this.activity.clearStorage(this.getArtifactRoot());
+		} catch (error) {
+			console.error('Voice journal could not clear stale activity logs.', error);
+		}
 		const agent = new CodingAgentClient();
 		agent.setRunTimeoutMs(this.settings.codingAgentTimeoutSeconds * 1000);
 		this.agent = agent;
@@ -93,7 +104,7 @@ export default class VoiceJournalPlugin extends Plugin {
 			(leaf) =>
 				new VoiceJournalActivityView(leaf, {
 					activity: this.activity,
-					isRunning: () => this.coordinator.isRunning(),
+					isRunning: () => this.runActive || this.coordinator.isRunning(),
 					getProgress: () => this.currentProgress,
 					runPipeline: async () =>
 						this.executePipeline('scan-and-process', 'command'),
@@ -144,18 +155,13 @@ export default class VoiceJournalPlugin extends Plugin {
 			checkProviders: async () => this.checkProviders(),
 			showStatus: async () => this.openActivityView(),
 			cancelPipeline: () => this.cancelPipeline(),
-			isRunning: () => this.coordinator.isRunning(),
+			isRunning: () => this.runActive || this.coordinator.isRunning(),
 		});
 		this.addRibbonIcon('audio-lines', 'Process voice journal recordings', () => {
 			void this.executePipeline('scan-and-process', 'ribbon');
 		});
 
 		this.app.workspace.onLayoutReady(() => this.scheduleStartupRun());
-		try {
-			await this.activity.clearStorage(this.getArtifactRoot());
-		} catch (error) {
-			console.error('Voice journal could not clear stale activity logs.', error);
-		}
 	}
 
 	onunload(): void {
@@ -167,23 +173,72 @@ export default class VoiceJournalPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		this.data.settings = this.settings;
-		await this.saveData(this.data);
+		await this.persistData();
 		this.agent?.setRunTimeoutMs(this.settings.codingAgentTimeoutSeconds * 1000);
-		this.applySourcesPropertyVisibility();
 	}
 
-	private trackWindowForStyling(target: Window): void {
-		this.styledWindows.add(target);
-		this.applySourcesPropertyVisibility();
-	}
-
-	private applySourcesPropertyVisibility(): void {
-		for (const target of this.styledWindows) {
-			target.document.body.classList.toggle(
-				HIDE_SOURCES_PROPERTY_CLASS,
-				this.settings.hideSourcesProperty,
-			);
+	/** Reads the key from secret storage, migrating a key left in data.json. */
+	private async loadSttApiKey(loaded: unknown): Promise<void> {
+		const storage = this.app.secretStorage;
+		const legacyKey = this.settings.sttApiKey;
+		const storedKey = storage.getSecret(STT_API_KEY_SECRET_ID);
+		if (legacyKey !== '') {
+			if (storedKey === null || storedKey === '') {
+				storage.setSecret(STT_API_KEY_SECRET_ID, legacyKey);
+			}
+			if (loaded !== null && loaded !== undefined) {
+				await this.persistData();
+			}
 		}
+		this.settings.sttApiKey =
+			storage.getSecret(STT_API_KEY_SECRET_ID) ?? legacyKey;
+	}
+
+	private async persistData(): Promise<void> {
+		const storage = this.app.secretStorage;
+		if ((storage.getSecret(STT_API_KEY_SECRET_ID) ?? '') !== this.settings.sttApiKey) {
+			storage.setSecret(STT_API_KEY_SECRET_ID, this.settings.sttApiKey);
+		}
+		await this.saveData({
+			...this.data,
+			settings: { ...this.data.settings, sttApiKey: '' },
+		});
+	}
+
+	/** One lock for everything that runs the agent or writes to the vault. */
+	private isBusy(): boolean {
+		return (
+			this.runActive ||
+			this.coordinator.isRunning() ||
+			this.followUpRunning ||
+			this.revertRunning
+		);
+	}
+
+	/** Warns about notes the user edited while the agent was also writing. */
+	private reportEditsDuringAgent(): void {
+		if (this.editedDuringAgent.size === 0) {
+			return;
+		}
+		const changed = new Set(
+			this.activity
+				.getEvents()
+				.flatMap((event) => event.changes ?? [])
+				.map((change) => change.path),
+		);
+		const overlapping = [...this.editedDuringAgent].filter((path) =>
+			changed.has(path),
+		);
+		this.editedDuringAgent.clear();
+		if (overlapping.length === 0) {
+			return;
+		}
+		this.activity.add({
+			kind: 'pipeline',
+			level: 'warning',
+			title: 'Notes edited during the agent run',
+			message: `You edited ${overlapping.join(', ')} while the agent was running. The change report includes your edits, and reverting would discard them.`,
+		});
 	}
 
 	private openPluginSettings(): void {
@@ -196,7 +251,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	async checkProviders(): Promise<void> {
-		if (this.coordinator.isRunning()) {
+		if (this.isBusy()) {
 			new Notice('A voice journal pipeline run is already active.');
 			return;
 		}
@@ -205,7 +260,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	async checkStt(): Promise<void> {
-		if (this.coordinator.isRunning()) {
+		if (this.isBusy()) {
 			new Notice('A voice journal pipeline run is already active.');
 			return;
 		}
@@ -214,7 +269,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	async checkCodingAgent(): Promise<void> {
-		if (this.coordinator.isRunning()) {
+		if (this.isBusy()) {
 			new Notice('A voice journal pipeline run is already active.');
 			return;
 		}
@@ -223,7 +278,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	async listCodingAgentModels(): Promise<string[]> {
-		if (this.coordinator.isRunning()) {
+		if (this.isBusy()) {
 			throw new Error('Wait for the active voice journal run to finish.');
 		}
 		return await this.coordinator.listCodingAgentModels();
@@ -270,17 +325,24 @@ export default class VoiceJournalPlugin extends Plugin {
 		origin: RunOrigin,
 		run: () => Promise<PipelineRunResult>,
 	): Promise<void> {
-		if (this.coordinator.isRunning()) {
-			new Notice('A voice journal pipeline run is already active.');
+		if (this.isBusy()) {
+			new Notice('A voice journal run or follow-up is already active.');
 			await this.openActivityView();
 			return;
 		}
-		await this.openActivityView();
-		await this.activity.startRun(
-			this.getArtifactRoot(),
-			origin,
-			mode,
-		);
+		this.runActive = true;
+		this.editedDuringAgent.clear();
+		try {
+			await this.openActivityView();
+			await this.activity.startRun(
+				this.getArtifactRoot(),
+				origin,
+				mode,
+			);
+		} catch (error) {
+			this.runActive = false;
+			throw error;
+		}
 		this.progressNotice = new Notice('Voice journal: starting…', 0);
 		this.statusBarItem.setText('Voice journal: starting…');
 		try {
@@ -321,6 +383,8 @@ export default class VoiceJournalPlugin extends Plugin {
 				8000,
 			);
 		} finally {
+			this.runActive = false;
+			this.reportEditsDuringAgent();
 			this.progressNotice?.hide();
 			this.progressNotice = null;
 			this.currentProgress = null;
@@ -332,7 +396,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	private async saveRuntime(runtime: RuntimeState): Promise<void> {
 		this.runtime = runtime;
 		this.data.runtime = runtime;
-		await this.saveData(this.data);
+		await this.persistData();
 		this.updateStatusBar();
 	}
 
@@ -389,6 +453,16 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	private cancelPipeline(): void {
+		if (this.followUpRunning) {
+			this.processor.cancel();
+			this.activity.add({
+				kind: 'run',
+				level: 'warning',
+				title: 'Cancellation requested',
+				message: 'Stopping the follow-up…',
+			});
+			return;
+		}
 		if (!this.coordinator.cancel()) {
 			new Notice('No voice journal run is active.');
 			return;
@@ -402,6 +476,22 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	private async revertFileChange(eventId: string, path: string): Promise<void> {
+		if (this.isBusy()) {
+			new Notice('Wait for the voice journal run to finish before reverting.');
+			return;
+		}
+		this.revertRunning = true;
+		try {
+			await this.revertFileChangeUnlocked(eventId, path);
+		} finally {
+			this.revertRunning = false;
+		}
+	}
+
+	private async revertFileChangeUnlocked(
+		eventId: string,
+		path: string,
+	): Promise<void> {
 		const event = this.activity
 			.getEvents()
 			.find((candidate) => candidate.id === eventId);
@@ -412,7 +502,11 @@ export default class VoiceJournalPlugin extends Plugin {
 			return;
 		}
 		try {
-			const reverted = await revertVaultFileChange(this.getVaultRoot(), change);
+			const reverted = await revertVaultFileChange(
+				this.getVaultRoot(),
+				change,
+				this.app.vault,
+			);
 			this.activity.updateChanges(
 				eventId,
 				changes.map((candidate) =>
@@ -429,6 +523,19 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	private async revertAllFileChanges(eventId: string): Promise<void> {
+		if (this.isBusy()) {
+			new Notice('Wait for the voice journal run to finish before reverting.');
+			return;
+		}
+		this.revertRunning = true;
+		try {
+			await this.revertAllFileChangesUnlocked(eventId);
+		} finally {
+			this.revertRunning = false;
+		}
+	}
+
+	private async revertAllFileChangesUnlocked(eventId: string): Promise<void> {
 		const event = this.activity
 			.getEvents()
 			.find((candidate) => candidate.id === eventId);
@@ -447,6 +554,7 @@ export default class VoiceJournalPlugin extends Plugin {
 				const reverted = await revertVaultFileChange(
 					this.getVaultRoot(),
 					change,
+					this.app.vault,
 				);
 				changes = changes.map((candidate) =>
 					candidate.path === change.path ? reverted : candidate,
@@ -477,7 +585,7 @@ export default class VoiceJournalPlugin extends Plugin {
 	}
 
 	private async acceptChanges(): Promise<void> {
-		if (this.coordinator.isRunning() || this.followUpRunning) {
+		if (this.isBusy()) {
 			new Notice('Wait for the voice journal run to finish.');
 			return;
 		}
@@ -490,7 +598,7 @@ export default class VoiceJournalPlugin extends Plugin {
 		if (trimmed === '') {
 			return;
 		}
-		if (this.coordinator.isRunning() || this.followUpRunning) {
+		if (this.isBusy()) {
 			new Notice('Wait for the voice journal run to finish.');
 			return;
 		}
@@ -504,6 +612,7 @@ export default class VoiceJournalPlugin extends Plugin {
 		const priorChanges = reportEvents.flatMap((event) => event.changes ?? []);
 		const changedPaths = [...new Set(priorChanges.map((change) => change.path))];
 		this.followUpRunning = true;
+		this.editedDuringAgent.clear();
 		const vaultRoot = this.getVaultRoot();
 		const artifactRoot = this.getArtifactRoot();
 		const progressNotice = new Notice('Voice journal: sending follow-up…', 0);
@@ -517,14 +626,15 @@ export default class VoiceJournalPlugin extends Plugin {
 				followUpMessage: trimmed,
 				reportActivity: (event) => this.activity.add(event),
 				reportProgress: (progress) => this.reportProgress(progress),
+				reuseSnapshot: preSnapshot,
 			});
 			if (agentFailure !== undefined) {
 				throw agentFailure instanceof Error
 					? agentFailure
 					: new Error('The coding agent failed to apply the follow-up.');
 			}
-			const baseline = effectiveBaselineSnapshot(preSnapshot, priorChanges);
-			const changes = compareVaultSnapshots(baseline, snapshotAfter);
+			const baseline = effectiveBaselineSnapshot(preSnapshot.snapshot, priorChanges);
+			const changes = compareVaultSnapshots(baseline, snapshotAfter.snapshot);
 			const [primary, ...superseded] = reportEvents;
 			if (primary !== undefined) {
 				this.activity.updateChanges(primary.id, changes);
@@ -547,6 +657,7 @@ export default class VoiceJournalPlugin extends Plugin {
 			this.currentProgress = null;
 			this.updateStatusBar();
 			this.followUpRunning = false;
+			this.reportEditsDuringAgent();
 		}
 	}
 

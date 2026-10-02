@@ -6,6 +6,7 @@ import {
 	FfmpegAudioSplitter,
 	isMissingExecutable,
 	parseFfmpegDuration,
+	segmentOutputPattern,
 } from '../src/audio/ffmpeg';
 
 const temporaryDirectories: string[] = [];
@@ -53,6 +54,9 @@ describe('FfmpegAudioSplitter', () => {
 			expect.arrayContaining([
 				'-i',
 				'/recordings/voice.wav',
+				'-map',
+				'0:a:0',
+				'-vn',
 				'-f',
 				'segment',
 				'-segment_time',
@@ -74,7 +78,37 @@ describe('FfmpegAudioSplitter', () => {
 
 		await expect(
 			splitter.split('/recordings/voice.wav', outputDir, 60, 'ffmpeg'),
-		).rejects.toThrow(/no such filter/);
+		).rejects.toThrow('ffmpeg failed to split the recording (exit code 1): no such filter');
+	});
+
+	it('reports a timeout even when ffmpeg printed nothing', async () => {
+		const outputDir = await tempDir();
+		const splitter = new FfmpegAudioSplitter(5_000, async () => ({
+			code: null,
+			signal: 'SIGTERM',
+			stderr: '',
+			timedOut: true,
+		}));
+
+		await expect(
+			splitter.split('/recordings/voice.wav', outputDir, 60, 'ffmpeg'),
+		).rejects.toThrow('ffmpeg failed to split the recording (timed out after 5000 ms).');
+	});
+
+	it('escapes percent signs in the segment output path', async () => {
+		const outputDir = await tempDir();
+		const percentDir = join(outputDir, '100% voice');
+		await mkdir(percentDir);
+		let pattern: string | undefined;
+		const splitter = new FfmpegAudioSplitter(5_000, async (_executable, args) => {
+			pattern = args.at(-1);
+			return { code: 0, stderr: '', timedOut: false };
+		});
+
+		await splitter.split('/recordings/50%.m4a', percentDir, 60, 'ffmpeg');
+
+		expect(pattern).toBe(join(outputDir, '100%% voice', 'chunk-%04d.m4a'));
+		expect(segmentOutputPattern('/a%b', '.x%y')).toBe('/a%%b/chunk-%04d.x%%y');
 	});
 
 	it('produces exactly one chunk for a recording shorter than the segment duration', async () => {
@@ -105,6 +139,23 @@ describe('duration probing', () => {
 			timedOut: false,
 		}));
 		expect(await splitter.probeDurationSeconds('/a.wav', 'ffmpeg')).toBeCloseTo(484.55);
+	});
+
+	it('keeps the head of stderr so the Duration line survives long metadata', async () => {
+		const retentions: Array<string | undefined> = [];
+		const splitter = new FfmpegAudioSplitter(
+			5_000,
+			async (_executable, _args, _timeoutMs, retention) => {
+				retentions.push(retention);
+				return {
+					code: 1,
+					stderr: `  Duration: 00:01:00.00\n${'lyrics '.repeat(1_000)}`,
+					timedOut: false,
+				};
+			},
+		);
+		expect(await splitter.probeDurationSeconds('/a.m4a', 'ffmpeg')).toBe(60);
+		expect(retentions).toEqual(['head']);
 	});
 
 	it('returns null when no duration is reported', async () => {

@@ -9,7 +9,7 @@ export class AgentLineBuffer {
 	}
 
 	flush(stream: 'stdout' | 'stderr'): string[] {
-		const tail = this.carry.get(stream) ?? '';
+		const tail = (this.carry.get(stream) ?? '').replace(/\r$/u, '');
 		this.carry.set(stream, '');
 		return tail === '' ? [] : [tail];
 	}

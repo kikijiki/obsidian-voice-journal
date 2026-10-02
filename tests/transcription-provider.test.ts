@@ -159,7 +159,7 @@ describe('OpenAiTranscriptionProvider', () => {
 				throw new SyntaxError('Unexpected token <');
 			},
 			text: html,
-		}));
+		}), 600_000, []);
 		await expect(
 			provider.transcribe('http://127.0.0.1:8001/v1', {
 				audio: new ArrayBuffer(0),
@@ -206,5 +206,27 @@ describe('OpenAiTranscriptionProvider', () => {
 			model: 'openai/whisper-1',
 			input_audio: { format: 'wav' },
 		});
+	});
+
+	it('retries rate limits and gateway errors before giving up', async () => {
+		let calls = 0;
+		const provider = new OpenAiTranscriptionProvider(
+			async () => {
+				calls += 1;
+				return calls < 3
+					? response(429, { error: { message: 'slow down' } })
+					: response(200, { text: 'hello' });
+			},
+			600_000,
+			[0, 0],
+		);
+		const result = await provider.transcribe('http://127.0.0.1:8001/v1', {
+			audio: new ArrayBuffer(0),
+			fileName: 'voice.wav',
+			contentType: 'audio/wav',
+			model: '',
+		});
+		expect(result.text).toBe('hello');
+		expect(calls).toBe(3);
 	});
 });

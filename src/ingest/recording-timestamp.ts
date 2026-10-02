@@ -38,19 +38,34 @@ export function parseFilenameTimestamp(
 		return null;
 	}
 
-	const date = new Date(0);
-	date.setFullYear(values.year, values.month - 1, values.day);
-	date.setHours(values.hour, values.minute, values.second, 0);
+	// Validate the fields in UTC, where every wall-clock time exists, so a
+	// time inside a daylight-saving gap is not mistaken for an invalid date.
+	const utc = new Date(
+		Date.UTC(
+			values.year,
+			values.month - 1,
+			values.day,
+			values.hour,
+			values.minute,
+			values.second,
+		),
+	);
 	if (
-		date.getFullYear() !== values.year ||
-		date.getMonth() !== values.month - 1 ||
-		date.getDate() !== values.day ||
-		date.getHours() !== values.hour ||
-		date.getMinutes() !== values.minute ||
-		date.getSeconds() !== values.second
+		utc.getUTCFullYear() !== values.year ||
+		utc.getUTCMonth() !== values.month - 1 ||
+		utc.getUTCDate() !== values.day ||
+		utc.getUTCHours() !== values.hour ||
+		utc.getUTCMinutes() !== values.minute ||
+		utc.getUTCSeconds() !== values.second
 	) {
 		return null;
 	}
+	// Local interpretation. A time skipped by a spring-forward gap resolves to
+	// the equivalent instant just after it (02:30 becomes 03:30); a repeated
+	// autumn hour resolves to its first occurrence.
+	const date = new Date(0);
+	date.setFullYear(values.year, values.month - 1, values.day);
+	date.setHours(values.hour, values.minute, values.second, 0);
 	return date.valueOf();
 }
 

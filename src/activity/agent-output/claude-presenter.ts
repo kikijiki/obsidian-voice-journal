@@ -5,6 +5,7 @@ import {
 	nonEmptyString,
 	prettyValue,
 	record,
+	resultErrorEvent,
 	toolIcon,
 	toolTitle,
 } from './shared';
@@ -90,6 +91,9 @@ function toolDetail(input: unknown, result?: unknown): string {
 
 export class ClaudeOutputPresenter implements AgentProtocolPresenter {
 	private readonly tools = new Map<string, ClaudeToolBuffer>();
+	// Fallback identities for tool blocks without ids; monotonic so rows never
+	// collide with (and overwrite) earlier ones.
+	private fallbackSequence = 0;
 
 	constructor(private readonly scope: string) {}
 
@@ -105,11 +109,16 @@ export class ClaudeOutputPresenter implements AgentProtocolPresenter {
 			return [formatAgentLine(line)];
 		}
 		const type = nonEmptyString(value.type);
-		// The init "system" message and the trailing "result" summary carry no
-		// user-facing content; every other turn is a fully-formed assistant or
-		// tool-result message (this CLI is not run with partial-message deltas).
-		if (type === 'system' || type === 'result') {
+		// The init "system" message and a successful trailing "result" summary
+		// carry no user-facing content; every other turn is a fully-formed
+		// assistant or tool-result message (this CLI is not run with
+		// partial-message deltas). Failed results surface as an error row.
+		if (type === 'system') {
 			return [];
+		}
+		if (type === 'result') {
+			const error = resultErrorEvent(value, 'Claude');
+			return error === null ? [] : [error];
 		}
 		if (type === 'assistant') {
 			return this.presentContent(record(value.message)?.content, 'assistant');
@@ -179,7 +188,7 @@ export class ClaudeOutputPresenter implements AgentProtocolPresenter {
 
 	private startTool(block: Record<string, unknown>): FormattedAgentLine {
 		const name = nonEmptyString(block.name) ?? 'tool';
-		const id = nonEmptyString(block.id) ?? `unknown-${(this.tools.size + 1).toString()}`;
+		const id = nonEmptyString(block.id) ?? this.fallbackId();
 		const buffer: ClaudeToolBuffer = {
 			key: `${this.scope}:claude-tool:${id}`,
 			name,
@@ -203,7 +212,7 @@ export class ClaudeOutputPresenter implements AgentProtocolPresenter {
 		const buffer: ClaudeToolBuffer = (id === undefined
 			? undefined
 			: this.tools.get(id)) ?? {
-			key: `${this.scope}:claude-tool:${id ?? 'unknown'}`,
+			key: `${this.scope}:claude-tool:${id ?? this.fallbackId()}`,
 			name: 'tool',
 			input: undefined,
 		};
@@ -222,6 +231,11 @@ export class ClaudeOutputPresenter implements AgentProtocolPresenter {
 			replaceKey: buffer.key,
 			persist: true,
 		};
+	}
+
+	private fallbackId(): string {
+		this.fallbackSequence += 1;
+		return `unknown-${this.fallbackSequence.toString()}`;
 	}
 
 	private interruptedTool(buffer: ClaudeToolBuffer): FormattedAgentLine {

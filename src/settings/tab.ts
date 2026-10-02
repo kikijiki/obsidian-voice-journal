@@ -16,10 +16,13 @@ import type {
 	SttProviderType,
 	VoiceJournalSettings,
 } from '../model';
-import { DEFAULT_AGENT_EXECUTABLES, normalizeVaultRelativePath } from './model';
+import {
+	DEFAULT_AGENT_EXECUTABLES,
+	DEFAULT_SETTINGS,
+	normalizeVaultRelativePath,
+} from './model';
 import { DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX } from '../ingest/recording-timestamp';
 import { OPENROUTER_STT_BASE_URL } from '../providers/openrouter';
-import { VOICE_JOURNAL_SOURCES_PROPERTY } from '../pipeline/recording-processor';
 
 export interface SettingsHost {
 	settings: VoiceJournalSettings;
@@ -132,7 +135,6 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 								pi: 'Pi',
 								claude: 'Claude Code',
 								codex: 'Codex',
-								cursor: 'Cursor',
 							})
 							.setValue(this.host.settings.codingAgentType)
 							.onChange(async (value) => {
@@ -154,16 +156,48 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 					);
 				},
 			},
-			this.textFieldDefinition(
-				'Coding-agent executable',
-				this.host.settings.codingAgentExecutable,
-				async (value) => {
-					this.host.settings.codingAgentExecutable = value;
-					this.invalidateCodingAgentModels();
-					await this.host.saveSettings();
-					this.update();
+			{
+				name: 'Coding-agent executable',
+				render: (setting) => {
+					setting.addText((text) => {
+						// Save on every keystroke, but only rediscover models (which
+						// spawns the CLI with --list-models) and re-render once the
+						// value is committed: on blur/Enter, or after a typing pause
+						// while the field no longer has focus.
+						let committed = this.host.settings.codingAgentExecutable;
+						let timer: number | null = null;
+						const commit = (): void => {
+							if (timer !== null) {
+								window.clearTimeout(timer);
+								timer = null;
+							}
+							const current = this.host.settings.codingAgentExecutable;
+							if (current === committed) {
+								return;
+							}
+							committed = current;
+							this.invalidateCodingAgentModels();
+							this.update();
+						};
+						text.inputEl.addEventListener('change', commit);
+						return text
+							.setValue(this.host.settings.codingAgentExecutable)
+							.onChange(async (value) => {
+								this.host.settings.codingAgentExecutable = value.trim();
+								await this.host.saveSettings();
+								if (timer !== null) {
+									window.clearTimeout(timer);
+								}
+								timer = window.setTimeout(() => {
+									timer = null;
+									if (text.inputEl.ownerDocument.activeElement !== text.inputEl) {
+										commit();
+									}
+								}, 800);
+							});
+					});
 				},
-			),
+			},
 		];
 
 		definitions.push(
@@ -278,10 +312,9 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 							})
 							.setValue(settings.sttProvider)
 							.onChange(async (value) => {
+								// sttBaseUrl keeps the custom URL; the pipeline picks the
+								// fixed OpenRouter endpoint by provider.
 								settings.sttProvider = value as SttProviderType;
-								if (settings.sttProvider === 'openrouter') {
-									settings.sttBaseUrl = OPENROUTER_STT_BASE_URL;
-								}
 								this.invalidateSttModels();
 								await this.host.saveSettings();
 								this.update();
@@ -777,22 +810,10 @@ export class VoiceJournalSettingTab extends PluginSettingTab {
 							.setPlaceholder('Journal')
 							.setValue(this.host.settings.journalDirectory)
 							.onChange(async (value) => {
+								// Match what loading the settings produces for a blank value.
 								this.host.settings.journalDirectory =
-									normalizeVaultRelativePath(normalizePath(value));
-								await this.host.saveSettings();
-							}),
-					);
-				},
-			},
-			{
-				name: 'Hide source markers property',
-				desc: `Hides the ${VOICE_JOURNAL_SOURCES_PROPERTY} property (long recording hashes) in the Properties panel. Only affects display; the frontmatter is unchanged and still visible in Source mode.`,
-				render: (setting) => {
-					setting.addToggle((toggle) =>
-						toggle
-							.setValue(this.host.settings.hideSourcesProperty)
-							.onChange(async (value) => {
-								this.host.settings.hideSourcesProperty = value;
+									normalizeVaultRelativePath(normalizePath(value)) ||
+									DEFAULT_SETTINGS.journalDirectory;
 								await this.host.saveSettings();
 							}),
 					);

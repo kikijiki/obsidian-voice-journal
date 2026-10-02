@@ -1,7 +1,7 @@
 export const PLUGIN_DATA_SCHEMA_VERSION = 1;
 
 export type StartupMode = 'off' | 'scan-only' | 'scan-and-process';
-export type CodingAgentType = 'pi' | 'claude' | 'codex' | 'cursor';
+export type CodingAgentType = 'pi' | 'claude' | 'codex';
 export type SttProviderType = 'custom' | 'openrouter';
 export type PipelineMode = 'scan-only' | 'scan-and-process';
 export type RunOrigin = 'command' | 'ribbon' | 'startup' | 'manual';
@@ -33,7 +33,6 @@ export interface VoiceJournalSettings {
 	recordingSources: RecordingSource[];
 	recordingGrouping: RecordingGrouping;
 	journalDirectory: string;
-	hideSourcesProperty: boolean;
 	codingAgentType: CodingAgentType;
 	codingAgentExecutable: string;
 	codingAgentModel: string;
@@ -69,11 +68,16 @@ export interface RunIssue {
 	message: string;
 }
 
+/**
+ * `complete` and `failed` are terminal: scheduled runs never pick those
+ * recordings up again. A manual pick from the activity panel retries `failed`.
+ */
 export type RecordingStage =
 	| 'discovered'
 	| 'copied'
 	| 'transcribed'
-	| 'complete';
+	| 'complete'
+	| 'failed';
 
 export interface RecordingState {
 	hash: string;
@@ -82,12 +86,18 @@ export interface RecordingState {
 	fileName: string;
 	size?: number;
 	sourceModifiedAtMs?: number;
+	recordedAtMs?: number;
 	archivedAudioPath?: string;
 	transcriptPath?: string;
 	rawResponsePath?: string;
 	attempts: number;
 	updatedAt: string;
 	lastError?: string;
+	/** Set before the agent runs, cleared on success; a resumed run warns the agent about possible partial edits. */
+	agentStartedAt?: string;
+	completedAt?: string;
+	/** Provenance: vault-relative notes the agent changed while processing this recording. */
+	notePaths?: string[];
 }
 
 export interface RuntimeState {

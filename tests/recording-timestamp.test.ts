@@ -59,4 +59,28 @@ describe('recording timestamps', () => {
 			),
 		).toBe(modifiedAtMs - 9 * 60 * 60 * 1000);
 	});
+
+	it('accepts a filename time inside a spring-forward gap', () => {
+		const previous = process.env.TZ;
+		process.env.TZ = 'Europe/Berlin';
+		try {
+			const parsed = parseFilenameTimestamp(
+				'TX01_MIC001_20260329_023000_orig.wav',
+				compileFilenameTimestampRegex(DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX),
+			);
+			expect(parsed).toBe(Date.parse('2026-03-29T03:30:00+02:00'));
+			expect(
+				parseFilenameTimestamp(
+					'TX01_MIC001_20260231_120000_orig.wav',
+					compileFilenameTimestampRegex(DEFAULT_DJI_FILENAME_TIMESTAMP_REGEX),
+				),
+			).toBeNull();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.TZ;
+			} else {
+				process.env.TZ = previous;
+			}
+		}
+	});
 });

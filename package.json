@@ -23,6 +23,7 @@
 	"license": "MIT",
 	"devDependencies": {
 		"@eslint/js": "^9.39.4",
+		"@types/cross-spawn": "^6.0.6",
 		"@types/node": "^22.15.17",
 		"esbuild": "^0.28.2",
 		"eslint": "^9.39.4",
@@ -38,6 +39,7 @@
 		"esbuild@0.28.2": true
 	},
 	"dependencies": {
+		"cross-spawn": "^7.0.6",
 		"diff": "^9.0.0"
 	}
 }

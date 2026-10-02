@@ -121,7 +121,14 @@ export class CodexOutputPresenter implements AgentProtocolPresenter {
 		) {
 			return [];
 		}
-		if (eventType !== 'item.started' && eventType !== 'item.completed') {
+		if (eventType === 'error' || eventType === 'turn.failed') {
+			return [this.errorEvent(eventType, value)];
+		}
+		if (
+			eventType !== 'item.started' &&
+			eventType !== 'item.updated' &&
+			eventType !== 'item.completed'
+		) {
 			return [formatAgentLine(line)];
 		}
 		const item = record(value.item);
@@ -143,6 +150,27 @@ export class CodexOutputPresenter implements AgentProtocolPresenter {
 		);
 		this.items.clear();
 		return events;
+	}
+
+	private errorEvent(
+		type: 'error' | 'turn.failed',
+		value: Record<string, unknown>,
+	): FormattedAgentLine {
+		const message =
+			nonEmptyString(value.message) ??
+			nonEmptyString(record(value.error)?.message) ??
+			nonEmptyString(value.error) ??
+			'Codex reported an error.';
+		return {
+			title: type === 'turn.failed' ? 'Codex turn failed' : 'Codex error',
+			message,
+			detail: prettyValue(value),
+			level: 'error',
+			presentation: 'event',
+			icon: 'circle-x',
+			status: 'failed',
+			persist: true,
+		};
 	}
 
 	private updateBuffer(

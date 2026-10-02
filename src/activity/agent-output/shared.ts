@@ -117,6 +117,48 @@ export function formatAgentLine(line: string): FormattedAgentLine {
 	}
 }
 
+/**
+ * Error row for a failed final `result` event (Claude stream-json), or null
+ * for a successful one.
+ */
+export function resultErrorEvent(
+	value: Record<string, unknown>,
+	agentName: string,
+): FormattedAgentLine | null {
+	const subtype = nonEmptyString(value.subtype);
+	const failed =
+		value.is_error === true ||
+		(subtype !== undefined && subtype.startsWith('error'));
+	if (!failed) {
+		return null;
+	}
+	const errors = Array.isArray(value.errors)
+		? value.errors.flatMap((error) => {
+				const text =
+					nonEmptyString(error) ?? nonEmptyString(record(error)?.message);
+				return text === undefined ? [] : [text];
+			})
+		: [];
+	const message =
+		nonEmptyString(value.result) ??
+		(errors.length > 0 ? errors.join('\n') : undefined) ??
+		nonEmptyString(record(value.error)?.message) ??
+		nonEmptyString(value.error) ??
+		(subtype === undefined
+			? `${agentName} reported an error.`
+			: `${agentName} reported an error (${subtype.replaceAll('_', ' ')}).`);
+	return {
+		title: `${agentName} run failed`,
+		message,
+		detail: prettyValue(value),
+		level: 'error',
+		presentation: 'event',
+		icon: 'circle-x',
+		status: 'failed',
+		persist: true,
+	};
+}
+
 export function numericValue(value: unknown, fallback: number): number {
 	return typeof value === 'number' && Number.isInteger(value)
 		? value

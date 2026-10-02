@@ -1,10 +1,16 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 const CACHE_GITIGNORE = '*\n';
 
 function isInside(parent: string, candidate: string): boolean {
-	return candidate.startsWith(`${parent}${sep}`);
+	const path = relative(parent, candidate);
+	return (
+		path !== '' &&
+		path !== '..' &&
+		!path.startsWith(`..${sep}`) &&
+		!isAbsolute(path)
+	);
 }
 
 export function resolvePluginArtifactRoot(

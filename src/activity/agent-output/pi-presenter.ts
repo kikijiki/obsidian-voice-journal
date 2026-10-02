@@ -119,11 +119,17 @@ export class PiOutputPresenter implements AgentProtocolPresenter {
 		const eventType = nonEmptyString(value.type);
 		if (eventType === 'message_start') {
 			const message = record(value.message);
-			if (message?.role === 'assistant') {
-				this.activeMessage = ++this.messageSequence;
-				this.content.clear();
+			if (message?.role !== 'assistant') {
+				return [];
 			}
-			return [];
+			// A new message while the previous one never reached message_end:
+			// finalize its buffers so their rows stop showing as streaming.
+			const unfinished = [...this.content.values()].map((buffer) =>
+				this.contentEvent(buffer, true),
+			);
+			this.content.clear();
+			this.activeMessage = ++this.messageSequence;
+			return unfinished;
 		}
 		if (eventType === 'message_end') {
 			return this.finishMessage(value);

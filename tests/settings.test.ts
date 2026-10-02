@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	DEFAULT_SETTINGS,
 	normalizeVaultRelativePath,
 	parsePluginData,
 } from '../src/settings/model';
@@ -31,13 +32,43 @@ describe('parsePluginData', () => {
 		expect(data.settings.agentUpdateExistingEntries).toBe(true);
 		expect(data.settings.additionalAgentInstructions).toBe('');
 		expect(data.settings.artifactCacheMaxMb).toBe(5_120);
-		expect(data.settings.hideSourcesProperty).toBe(true);
 		expect(data.settings.schemaVersion).toBe(1);
 	});
 
-	it('preserves an explicit choice to show the sources property', () => {
-		const data = parsePluginData({ settings: { hideSourcesProperty: false } });
-		expect(data.settings.hideSourcesProperty).toBe(false);
+	it('drops recording sources with duplicate ids', () => {
+		const data = parsePluginData({
+			settings: {
+				recordingSources: [
+					{ id: 'dji', path: '/a' },
+					{ id: 'dji', path: '/b' },
+				],
+			},
+		});
+		expect(data.settings.recordingSources.map((source) => source.path)).toEqual([
+			'/a',
+		]);
+	});
+
+	it('keeps provenance fields and the failed stage on recording states', () => {
+		const hash = 'a'.repeat(64);
+		const data = parsePluginData({
+			runtime: {
+				recordings: {
+					[hash]: {
+						stage: 'failed',
+						recordedAtMs: 5,
+						notePaths: ['Journal/2026-09-29.md', 3],
+						completedAt: '2026-09-29T00:00:00.000Z',
+					},
+				},
+			},
+		});
+		expect(data.runtime.recordings[hash]).toMatchObject({
+			stage: 'failed',
+			recordedAtMs: 5,
+			notePaths: ['Journal/2026-09-29.md'],
+			completedAt: '2026-09-29T00:00:00.000Z',
+		});
 	});
 
 	it('preserves disabled auxiliary-note permissions', () => {
@@ -161,8 +192,13 @@ describe('parsePluginData', () => {
 	});
 
 	it('uses the selected agent default executable', () => {
+		const data = parsePluginData({ settings: { codingAgentType: 'codex' } });
+		expect(data.settings.codingAgentExecutable).toBe('codex');
+	});
+
+	it('falls back to the default agent for a removed agent type', () => {
 		const data = parsePluginData({ settings: { codingAgentType: 'cursor' } });
-		expect(data.settings.codingAgentExecutable).toBe('cursor-agent');
+		expect(data.settings.codingAgentType).toBe(DEFAULT_SETTINGS.codingAgentType);
 	});
 
 	it('preserves a draft source and lets the scanner validate its path', () => {

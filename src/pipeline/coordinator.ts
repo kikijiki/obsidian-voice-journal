@@ -16,8 +16,12 @@ import type {
 	ScanResult,
 } from '../model';
 import type { NewActivityEvent } from '../activity/log';
-import { OPENROUTER_STT_MODEL_QUERY } from '../providers/openrouter';
+import {
+	effectiveSttBaseUrl,
+	OPENROUTER_STT_MODEL_QUERY,
+} from '../providers/openrouter';
 import { formatLocalTimestamp } from '../ingest/recording-timestamp';
+import { pruneArtifactCache } from '../storage/artifact-cache';
 import type {
 	ProcessRecordingInput,
 	ProcessRecordingOutcome,
@@ -28,7 +32,10 @@ interface Scanner {
 		sources: VoiceJournalSettings['recordingSources'],
 		maxEntries: number,
 	): Promise<ScanResult>;
-	scanPaths(absolutePaths: string[]): Promise<ScanResult>;
+	scanPaths(
+		absolutePaths: string[],
+		sources?: VoiceJournalSettings['recordingSources'],
+	): Promise<ScanResult>;
 }
 
 interface HealthProvider {
@@ -93,6 +100,47 @@ function freshCounters(): RunCounters {
 		scanErrorCount: 0,
 		warningCount: 0,
 	};
+}
+
+/** Stops a run after this many groups fail in a row, e.g. during a service outage. */
+const MAX_CONSECUTIVE_GROUP_FAILURES = 3;
+
+function isTerminal(state: RecordingState | undefined): boolean {
+	return state?.stage === 'complete' || state?.stage === 'failed';
+}
+
+/**
+ * Unfinished recordings whose source file is no longer being scanned (for
+ * example, a wiped or unmounted device) but whose archived audio or transcript
+ * lets processing continue without it.
+ */
+function resumableOrphans(
+	runtime: RuntimeState,
+	scannedPaths: ReadonlySet<string>,
+): Array<{ candidate: AudioCandidate; hash: string }> {
+	return Object.values(runtime.recordings).flatMap((state) => {
+		const resumable =
+			(state.stage === 'copied' && state.archivedAudioPath !== undefined) ||
+			(state.stage === 'transcribed' && state.transcriptPath !== undefined);
+		if (!resumable || scannedPaths.has(state.sourcePath)) {
+			return [];
+		}
+		const modifiedAtMs = state.sourceModifiedAtMs ?? Date.parse(state.updatedAt);
+		return [
+			{
+				hash: state.hash,
+				candidate: {
+					sourceId: 'resumed',
+					absolutePath: state.sourcePath,
+					relativePath: state.fileName,
+					fileName: state.fileName,
+					size: state.size ?? 0,
+					modifiedAtMs,
+					recordedAtMs: state.recordedAtMs ?? modifiedAtMs,
+				},
+			},
+		];
+	});
 }
 
 function localDateKey(timestampMs: number): string {
@@ -160,7 +208,7 @@ export class PipelineCoordinator {
 	async checkStt(): Promise<ProviderHealth> {
 		const settings = this.dependencies.getSettings();
 		return await this.dependencies.provider.checkHealth(
-			settings.sttBaseUrl,
+			effectiveSttBaseUrl(settings),
 			settings.sttApiKey,
 		);
 	}
@@ -168,7 +216,7 @@ export class PipelineCoordinator {
 	async listSttModels(): Promise<string[]> {
 		const settings = this.dependencies.getSettings();
 		return await this.dependencies.provider.listModels(
-			settings.sttBaseUrl,
+			effectiveSttBaseUrl(settings),
 			settings.sttApiKey,
 			settings.sttProvider === 'openrouter' ? OPENROUTER_STT_MODEL_QUERY : undefined,
 		);
@@ -218,7 +266,10 @@ export class PipelineCoordinator {
 				settings.recordingSources,
 				settings.maxEntriesPerScan,
 			);
-			return await this.processScan(scan, mode, origin, startedAt, counters, issues);
+			return await this.processScan(scan, mode, origin, startedAt, counters, issues, {
+				resumeOrphans: true,
+				retryFailed: false,
+			});
 		} catch (error) {
 			return await this.finishWithFatalError(
 				error,
@@ -252,8 +303,14 @@ export class PipelineCoordinator {
 				stage: 'scanning',
 				message: 'Preparing the selected recording(s)…',
 			});
-			const scan = await this.dependencies.scanner.scanPaths(absolutePaths);
-			return await this.processScan(scan, mode, origin, startedAt, counters, issues);
+			const scan = await this.dependencies.scanner.scanPaths(
+				absolutePaths,
+				this.dependencies.getSettings().recordingSources,
+			);
+			return await this.processScan(scan, mode, origin, startedAt, counters, issues, {
+				resumeOrphans: false,
+				retryFailed: true,
+			});
 		} catch (error) {
 			return await this.finishWithFatalError(
 				error,
@@ -312,6 +369,7 @@ export class PipelineCoordinator {
 		startedAt: Date,
 		counters: RunCounters,
 		issues: RunIssue[],
+		options: { resumeOrphans: boolean; retryFailed: boolean },
 	): Promise<PipelineRunResult> {
 		const settings = this.dependencies.getSettings();
 		const runtime = this.dependencies.getRuntime();
@@ -397,33 +455,62 @@ export class PipelineCoordinator {
 			});
 			return { scan, summary };
 		}
-		if (scanErrorCount > 0) {
-			const message = `Stopped before processing because ${scanErrorCount.toString()} source scan error${scanErrorCount === 1 ? '' : 's'} occurred.`;
-			const summary = this.makeSummary({
-				startedAt,
-				origin,
-				mode,
-				candidateCount,
-				processedCount,
-				skippedCount,
-				processingFailureCount,
-				scanErrorCount,
-				warningCount,
-				errorCount: scanErrorCount,
-				issues,
-				message,
-				status: 'failed',
-			});
-			await this.dependencies.saveRuntime({ ...runtime, lastRun: summary });
-			this.dependencies.reportProgress({
-				stage: 'failed',
-				message,
-			});
-			return { scan, summary };
+		const statesByFileName = new Map<string, RecordingState[]>();
+		for (const state of Object.values(runtime.recordings)) {
+			const bucket = statesByFileName.get(state.fileName) ?? [];
+			bucket.push(state);
+			statesByFileName.set(state.fileName, bucket);
 		}
+		const findStateByFingerprint = (
+			target: AudioCandidate,
+		): RecordingState | undefined =>
+			statesByFileName
+				.get(target.fileName)
+				?.find(
+					(state) =>
+						state.size === target.size &&
+						state.sourceModifiedAtMs === target.modifiedAtMs,
+				);
+		// Recordings already known to be finished are counted without touching
+		// the services, so an offline STT server does not fail an idle run.
+		const knownHashes = new Map<AudioCandidate, string>();
+		const pending: AudioCandidate[] = [];
+		for (const candidate of scan.candidates) {
+			const known = findStateByFingerprint(candidate);
+			if (
+				known !== undefined &&
+				(known.stage === 'complete' ||
+					(known.stage === 'failed' && !options.retryFailed))
+			) {
+				skippedCount += 1;
+			} else {
+				pending.push(candidate);
+			}
+		}
+		if (options.resumeOrphans) {
+			const scannedPaths = new Set(
+				scan.candidates.map((candidate) => candidate.absolutePath),
+			);
+			const orphans = resumableOrphans(runtime, scannedPaths);
+			for (const orphan of orphans) {
+				knownHashes.set(orphan.candidate, orphan.hash);
+				pending.push(orphan.candidate);
+			}
+			if (orphans.length > 0) {
+				candidateCount += orphans.length;
+				counters.candidateCount = candidateCount;
+				this.dependencies.reportActivity?.({
+					kind: 'pipeline',
+					title: 'Resuming unfinished recordings',
+					message: `${orphans.length.toString()} recording(s) are no longer on the source but can be finished from the plugin cache.`,
+					stage: 'scanning',
+				});
+			}
+		}
+		counters.skippedCount = skippedCount;
 
 		let providers: ProviderHealthReport | undefined;
-		if (candidateCount > 0) {
+		if (pending.length > 0) {
 			this.dependencies.reportProgress({
 				stage: 'checking-services',
 				message: 'Checking speech-to-text and coding-agent services…',
@@ -442,17 +529,9 @@ export class PipelineCoordinator {
 			}
 		}
 
-		const groups = groupRecordingCandidates(
-			scan.candidates,
-			settings.recordingGrouping,
-		);
-		const statesByFileName = new Map<string, RecordingState[]>();
-		for (const state of Object.values(runtime.recordings)) {
-			const bucket = statesByFileName.get(state.fileName) ?? [];
-			bucket.push(state);
-			statesByFileName.set(state.fileName, bucket);
-		}
-		let candidateIndex = 0;
+		const groups = groupRecordingCandidates(pending, settings.recordingGrouping);
+		let candidateIndex = skippedCount;
+		let consecutiveGroupFailures = 0;
 		for (const group of groups) {
 			if (this.cancelRequested) {
 				break;
@@ -471,7 +550,7 @@ export class PipelineCoordinator {
 				return {
 					candidate,
 					settings,
-					sttBaseUrl: settings.sttBaseUrl,
+					sttBaseUrl: effectiveSttBaseUrl(settings),
 					sttApiKey: settings.sttApiKey,
 					sttRequestFormat:
 						settings.sttProvider === 'openrouter'
@@ -482,14 +561,9 @@ export class PipelineCoordinator {
 					vaultRoot: this.dependencies.getVaultRoot(),
 					artifactRoot: this.dependencies.getArtifactRoot(),
 					findState: (hash: string) => runtime.recordings[hash],
-					findStateByFingerprint: (target: AudioCandidate) =>
-						statesByFileName
-							.get(target.fileName)
-							?.find(
-								(state) =>
-									state.size === target.size &&
-									state.sourceModifiedAtMs === target.modifiedAtMs,
-							),
+					findStateByFingerprint,
+					knownHash: knownHashes.get(candidate),
+					retryFailed: options.retryFailed,
 					// Mutates the live state so the fingerprint is persisted by the
 					// end-of-run save instead of writing once per skipped recording.
 					recordFingerprint: (state: RecordingState, target: AudioCandidate) => {
@@ -510,13 +584,15 @@ export class PipelineCoordinator {
 			let groupFailed = false;
 			try {
 				const outcomes = await this.dependencies.processor.processBatch(inputs);
+				groupFailed =
+					outcomes.length > 0 &&
+					outcomes.every((outcome) => outcome.result === 'failed');
 				for (const outcome of outcomes) {
 					if (outcome.result === 'skipped') {
 						skippedCount += 1;
 					} else if (outcome.result === 'processed') {
 						processedCount += 1;
 					} else {
-						groupFailed = true;
 						processingFailureCount += 1;
 						const message = errorMessage(outcome.error);
 						issues.push({
@@ -555,10 +631,22 @@ export class PipelineCoordinator {
 				});
 			}
 			candidateIndex += group.length;
-			if (groupFailed) {
+			counters.processedCount = processedCount;
+			counters.skippedCount = skippedCount;
+			counters.processingFailureCount = processingFailureCount;
+			// Keep going past a failed group so one bad recording cannot block
+			// newer ones, but stop when failures look systemic.
+			consecutiveGroupFailures = groupFailed ? consecutiveGroupFailures + 1 : 0;
+			if (consecutiveGroupFailures >= MAX_CONSECUTIVE_GROUP_FAILURES) {
+				issues.push({
+					severity: 'error',
+					path: '',
+					message: `Stopped after ${MAX_CONSECUTIVE_GROUP_FAILURES.toString()} consecutive failed groups.`,
+				});
 				break;
 			}
 		}
+		await this.pruneCache(runtime);
 
 		if (this.cancelRequested) {
 			const message = `Cancelled after processing ${processedCount.toString()} recording(s).`;
@@ -585,8 +673,15 @@ export class PipelineCoordinator {
 			return { scan, providers, summary };
 		}
 
+		const failedCount = Object.values(runtime.recordings).filter(
+			(state) => state.stage === 'failed',
+		).length;
 		const errorCount = processingFailureCount + scanErrorCount;
-		const message = `Processed ${processedCount.toString()}, already complete ${skippedCount.toString()}, recording failures ${processingFailureCount.toString()}, scan errors ${scanErrorCount.toString()}, timestamp warnings ${warningCount.toString()}.`;
+		const failedNote =
+			failedCount === 0
+				? ''
+				: ` ${failedCount.toString()} recording(s) are marked as failed and are skipped until picked manually.`;
+		const message = `Processed ${processedCount.toString()}, already complete ${skippedCount.toString()}, recording failures ${processingFailureCount.toString()}, scan errors ${scanErrorCount.toString()}, timestamp warnings ${warningCount.toString()}.${failedNote}`;
 		const summary = this.makeSummary({
 			startedAt,
 			origin,
@@ -609,6 +704,38 @@ export class PipelineCoordinator {
 			total: candidateCount,
 		});
 		return { scan, providers, summary };
+	}
+
+	private async pruneCache(runtime: RuntimeState): Promise<void> {
+		const settings = this.dependencies.getSettings();
+		// Anything unfinished may still need its archived audio or transcript.
+		const protectedHashes = new Set(
+			Object.values(runtime.recordings)
+				.filter((state) => !isTerminal(state))
+				.map((state) => state.hash),
+		);
+		try {
+			const result = await pruneArtifactCache(
+				this.dependencies.getArtifactRoot(),
+				settings.artifactCacheMaxMb * 1024 * 1024,
+				protectedHashes,
+			);
+			if (result.deletedDirectories.length > 0) {
+				this.dependencies.reportActivity?.({
+					kind: 'pipeline',
+					level: 'info',
+					title: 'Artifact cache pruned',
+					message: `${result.deletedDirectories.length.toString()} old recording artifact(s) removed.`,
+				});
+			}
+		} catch (error) {
+			this.dependencies.reportActivity?.({
+				kind: 'pipeline',
+				level: 'warning',
+				title: 'Artifact cache cleanup failed',
+				message: errorMessage(error),
+			});
+		}
 	}
 
 	private makeSummary(input: {

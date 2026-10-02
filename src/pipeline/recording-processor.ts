@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { Dirent } from 'node:fs';
 import { createReadStream } from 'node:fs';
 import {
 	copyFile,
@@ -47,9 +46,8 @@ import {
 import {
 	compareVaultSnapshots,
 	snapshotVaultNotes,
-	type VaultSnapshot,
+	type VaultSnapshotResult,
 } from '../changes/vault-changes';
-import { pruneArtifactCache } from '../storage/artifact-cache';
 import {
 	FfmpegAudioSplitter,
 	isMissingExecutable,
@@ -90,6 +88,10 @@ export interface ProcessRecordingInput {
 	findState: (hash: string) => RecordingState | undefined;
 	findStateByFingerprint?: (candidate: AudioCandidate) => RecordingState | undefined;
 	recordFingerprint?: (state: RecordingState, candidate: AudioCandidate) => void;
+	/** Content hash already known for this candidate (a resumed recording whose source is gone). */
+	knownHash?: string;
+	/** Retries a recording previously marked as permanently failed (manual picks). */
+	retryFailed?: boolean;
 	saveState: SaveRecordingState;
 	reportProgress: ReportProgress;
 	reportActivity?: (event: NewActivityEvent) => void;
@@ -108,18 +110,32 @@ interface PreparedRecording {
 	input: ProcessRecordingInput;
 	hash: string;
 	state: RecordingState;
-	marker: string;
-	journalRoot: string;
+	/** A previous agent run for this recording started but never completed. */
+	resumed: boolean;
 }
 
-const SOURCE_MARKER_PATTERN = /sha256:[a-f0-9]{64}/gu;
+/** Transient failures are retried on later runs until this many attempts. */
+export const MAX_RECORDING_ATTEMPTS = 5;
 
-// Kept in sync by hand with the `.metadata-property[data-property-key="..."]`
-// selector in styles.css that hides this property in the Properties panel.
-export const VOICE_JOURNAL_SOURCES_PROPERTY = 'voice_journal_sources';
+/** A failure that retrying cannot fix; the recording is marked `failed`. */
+export class PermanentRecordingError extends Error {}
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : 'Unknown processing error.';
+}
+
+function failureStage(
+	input: ProcessRecordingInput,
+	state: RecordingState,
+	error: unknown,
+): RecordingState['stage'] {
+	if (input.isCancelled?.() === true) {
+		return state.stage;
+	}
+	return error instanceof PermanentRecordingError ||
+		state.attempts >= MAX_RECORDING_ATTEMPTS
+		? 'failed'
+		: state.stage;
 }
 
 function assertNotCancelled(input: ProcessRecordingInput): void {
@@ -149,11 +165,7 @@ async function assertStable(
 	const first = await stat(candidate.absolutePath);
 	await wait(stabilityDelayMs);
 	const second = await stat(candidate.absolutePath);
-	if (
-		first.size === 0 ||
-		first.size !== second.size ||
-		first.mtimeMs !== second.mtimeMs
-	) {
+	if (first.size !== second.size || first.mtimeMs !== second.mtimeMs) {
 		throw new Error('Recording is still changing; it will be retried later.');
 	}
 }
@@ -175,6 +187,7 @@ function audioContentType(path: string): string {
 
 function combineTranscriptionResults(
 	results: TranscriptionResult[],
+	plannedChunkSeconds: number,
 ): TranscriptionResult {
 	if (results.length === 1 && results[0] !== undefined) {
 		return results[0];
@@ -193,9 +206,9 @@ function combineTranscriptionResults(
 				text: segment.text,
 			});
 		}
-		if (result.duration !== undefined) {
-			offsetSeconds += result.duration;
-		}
+		// Plain `json` responses omit the duration; the planned split length
+		// keeps later parts' segment times from restarting at zero.
+		offsetSeconds += result.duration ?? plannedChunkSeconds;
 	}
 	return {
 		text: results
@@ -291,11 +304,15 @@ async function discardArchivedAudio(
 	state.archivedAudioPath = undefined;
 }
 
-async function verifiedCopy(source: string, destination: string): Promise<void> {
+// Verifies against the hash the recording is stored under, so a source that
+// changes mid-copy can never leave different audio under that hash.
+async function verifiedCopy(
+	source: string,
+	destination: string,
+	expectedHash: string,
+): Promise<void> {
 	try {
-		const existingHash = await hashFile(destination);
-		const sourceHash = await hashFile(source);
-		if (existingHash === sourceHash) {
+		if ((await hashFile(destination)) === expectedHash) {
 			return;
 		}
 	} catch {
@@ -305,12 +322,10 @@ async function verifiedCopy(source: string, destination: string): Promise<void> 
 	const temporaryPath = `${destination}.partial-${randomUUID()}`;
 	try {
 		await copyFile(source, temporaryPath);
-		const [sourceHash, copiedHash] = await Promise.all([
-			hashFile(source),
-			hashFile(temporaryPath),
-		]);
-		if (sourceHash !== copiedHash) {
-			throw new Error('Copied recording failed hash verification.');
+		if ((await hashFile(temporaryPath)) !== expectedHash) {
+			throw new Error(
+				'Copied recording failed hash verification; the source changed while it was being copied.',
+			);
 		}
 		await promoteTemporary(temporaryPath, destination);
 	} catch (error) {
@@ -319,71 +334,25 @@ async function verifiedCopy(source: string, destination: string): Promise<void> 
 	}
 }
 
-function extractSourceMarkers(contents: string): string[] {
-	const frontmatter = contents.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1];
-	if (frontmatter === undefined) {
-		return [];
+// Leftovers from a crash during an atomic write or copy.
+async function removeStaleTemporaries(directory: string): Promise<void> {
+	let names: string[];
+	try {
+		names = await readdir(directory);
+	} catch {
+		return;
 	}
-	const lines = frontmatter.split(/\r?\n/u);
-	const propertyIndex = lines.findIndex((line) =>
-		new RegExp(`^${VOICE_JOURNAL_SOURCES_PROPERTY}\\s*:`, 'u').test(line),
+	await Promise.all(
+		names
+			.filter((name) =>
+				/\.(?:partial|backup|chunks)-[0-9a-f-]{36}$/u.test(name),
+			)
+			.map(async (name) =>
+				await rm(join(directory, name), { recursive: true, force: true }).catch(
+					() => undefined,
+				),
+			),
 	);
-	if (propertyIndex < 0) {
-		return [];
-	}
-	const markers: string[] = [];
-	const collect = (line: string): void => {
-		markers.push(...(line.match(SOURCE_MARKER_PATTERN) ?? []));
-	};
-	collect(lines[propertyIndex] ?? '');
-	for (const line of lines.slice(propertyIndex + 1)) {
-		if (line.trim() === '') {
-			continue;
-		}
-		if (!/^\s/u.test(line)) {
-			break;
-		}
-		collect(line);
-	}
-	return markers;
-}
-
-async function collectJournalSourceMarkers(
-	directory: string,
-	maxEntries: number,
-): Promise<Set<string>> {
-	const markers = new Set<string>();
-	let visited = 0;
-	const visit = async (path: string): Promise<void> => {
-		let entries: Dirent[];
-		try {
-			entries = await readdir(path, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			visited += 1;
-			if (visited > maxEntries) {
-				throw new Error(
-					'Journal marker verification reached the configured scan limit.',
-				);
-			}
-			if (entry.isSymbolicLink() || entry.name === '.voice-journal') {
-				continue;
-			}
-			const entryPath = join(path, entry.name);
-			if (entry.isDirectory()) {
-				await visit(entryPath);
-			} else if (entry.isFile() && extname(entry.name).toLowerCase() === '.md') {
-				const contents = await readFile(entryPath, 'utf8');
-				for (const marker of extractSourceMarkers(contents)) {
-					markers.add(marker);
-				}
-			}
-		}
-	};
-	await visit(directory);
-	return markers;
 }
 
 export function buildJournalAgentPrompt(input: {
@@ -393,9 +362,10 @@ export function buildJournalAgentPrompt(input: {
 	additionalInstructions: string;
 	recordings: Array<{
 		fileName: string;
-		sourceHash: string;
 		recordedAt: string;
 		transcriptPath: string;
+		/** A previous attempt may already have applied some of these edits. */
+		resumed?: boolean;
 	}>;
 }): string {
 	const auxiliaryPermissions = [
@@ -411,9 +381,11 @@ export function buildJournalAgentPrompt(input: {
 			(recording, index) => `### Recording ${(index + 1).toString()}
 - Raw transcript: ${JSON.stringify(recording.transcriptPath)}
 - Original filename: ${JSON.stringify(recording.fileName)}
-- SHA-256: ${recording.sourceHash}
-- Recording time: ${recording.recordedAt}
-- Frontmatter source value: "sha256:${recording.sourceHash}"`,
+- Recording time: ${recording.recordedAt}${
+				recording.resumed === true
+					? '\n- A previous attempt to process this recording was interrupted and may already have applied some edits. Check the relevant notes first and do not add the same content twice.'
+					: ''
+			}`,
 		)
 		.join('\n\n');
 	const additionalInstructions = input.additionalInstructions.trim();
@@ -430,7 +402,7 @@ Perform the following task:
 2. Inspect a representative set of nearby and recent journal entries before writing. Learn how this user normally writes, which language and tone they use, how they structure entries, and which frontmatter properties they use. Follow those conventions when the current transcript supports them. For example, habit tags may be appropriate if nearby notes use them, but no particular tag or optional metadata field is hardcoded.
 3. Search the whole vault for existing notes related to people, topics, projects, books, places, and other entities mentioned in the transcript.
 4. Add natural Obsidian wikilinks to matching existing notes. For example, if People/Women/Samantha.md is the matching person note, write [[Samantha]]. Use a path-qualified target when duplicate titles require disambiguation, and preserve a natural display alias when appropriate.
-5. Create or update the appropriate journal entry.
+5. Decide which journal entry or entries the content belongs to, then create or update them. The recording time is a hint, not a rule: a recording made shortly after midnight usually describes the previous day, and a recording may describe events from other days ("yesterday", "last Saturday"). Put each part where it belongs, and split one recording across several entries when it clearly covers several days. When the content gives no clear indication, use the day of the recording time.
 6. Apply the auxiliary-note permissions below when information belongs elsewhere in the vault.
 
 Auxiliary-note permissions:
@@ -449,9 +421,8 @@ Constraints:
 - Obsidian wikilinks may be written as [[Title]], as a path-qualified target such as [[People/Women/Samantha]], or with display text such as [[People/Women/Samantha|Samantha]]. Notes may also declare aliases in frontmatter. When finding a note or grepping for existing references, account for filenames with spaces, path-qualified targets, frontmatter aliases, and the target before the | in aliased wikilinks. Do not conclude that a note or reference is absent after searching only one literal display form.
 - Read the exact raw transcript paths listed above even though they are in the plugin's hidden operational directory.
 - Never search inside .voice-journal, hidden folders, run logs, audio, transcripts, notebooks, or other non-Markdown files beyond those exact transcript reads. Do not feed operational logs back into the agent context.
-- Search for an idempotency marker only inside ${JSON.stringify(input.journalDirectory)}, with glob "**/*.md", literal true, and a small result limit.
-- Every journal entry you create or modify for these recordings must have valid YAML frontmatter at the very beginning of the file. Preserve and merge existing frontmatter. For a newly created daily note, add a date property whose value is YYYY-MM-DD.
-- Store provenance in a ${VOICE_JOURNAL_SOURCES_PROPERTY} YAML list. Add each exact quoted frontmatter source value listed above. Never write voice-journal provenance as an HTML comment or visible body text.
+- Preserve and merge existing frontmatter. For a newly created daily note, follow the frontmatter convention of nearby daily notes.
+- Do not record voice-journal provenance (filenames, hashes, recording IDs) in notes, frontmatter, or HTML comments; the plugin tracks it separately.
 - Obsidian displays the filename as the inline title. When a daily note filename is YYYY-MM-DD.md, do not add an H1 containing the same date. Begin with prose or a meaningful H2 section instead.
 - If a tool fails, inspect its error and choose a corrected or simpler action. Never repeat an identical failed call. In particular, an EISDIR error means you must select a file inside that directory before calling read again.
 - Preserve unrelated manual content.
@@ -460,7 +431,6 @@ Constraints:
 - Do not modify anything under .voice-journal.
 - Do not create review queues, provenance directories, or a new vault taxonomy.
 - Make the smallest coherent set of edits.
-- For every recording, search for its exact frontmatter source value before writing. Do not duplicate contributions whose source value already exists. Merge each missing value into the target journal entry's ${VOICE_JOURNAL_SOURCES_PROPERTY} list.
 
 ${additionalInstructions === '' ? '' : `Trusted user-supplied vault instructions:\n${additionalInstructions}\n`}
 
@@ -501,7 +471,7 @@ Constraints:
 - Treat Markdown filenames as human-readable note titles; they commonly contain spaces and punctuation.
 - Obsidian wikilinks may be written as [[Title]], as a path-qualified target, or with display text such as [[Title|Alias]]. Notes may also declare aliases in frontmatter.
 - If a tool fails, inspect its error and choose a corrected or simpler action. Never repeat an identical failed call.
-- Preserve existing frontmatter, including the ${VOICE_JOURNAL_SOURCES_PROPERTY} provenance list; never remove or duplicate its entries.
+- Preserve existing frontmatter.
 - Preserve unrelated manual content.
 - Create or modify Markdown notes only. Do not edit Obsidian configuration, attachments, or non-Markdown files.
 - Never delete notes, recordings, or transcript artifacts.
@@ -541,19 +511,22 @@ export class RecordingProcessor {
 	): Promise<ProcessRecordingOutcome[]> {
 		const outcomes: ProcessRecordingOutcome[] = [];
 		const prepared: PreparedRecording[] = [];
-		const knownMarkers = await this.collectKnownMarkers(inputs);
+		const preparedHashes = new Set<string>();
 		for (const input of inputs) {
 			try {
-				const recording = await this.prepare(input, knownMarkers);
-				if (recording === 'skipped') {
+				const recording = await this.prepare(input);
+				if (recording === 'skipped' || preparedHashes.has(recording.hash)) {
+					// Identical audio twice in one group is journaled once.
 					outcomes.push({ candidate: input.candidate, result: 'skipped' });
 				} else {
+					preparedHashes.add(recording.hash);
 					prepared.push(recording);
 				}
 			} catch (error) {
 				if (input.isCancelled?.() === true) {
 					throw error;
 				}
+				// One bad recording must not hold back the rest of its group.
 				outcomes.push({
 					candidate: input.candidate,
 					result: 'failed',
@@ -562,7 +535,6 @@ export class RecordingProcessor {
 							? error
 							: new Error('Unknown recording preparation error.'),
 				});
-				return outcomes;
 			}
 		}
 
@@ -595,31 +567,22 @@ export class RecordingProcessor {
 		return outcomes;
 	}
 
-	private async collectKnownMarkers(
-		inputs: ProcessRecordingInput[],
-	): Promise<Set<string>> {
-		const first = inputs[0];
-		if (first === undefined) {
-			return new Set();
-		}
-		return await collectJournalSourceMarkers(
-			resolve(first.vaultRoot, first.settings.journalDirectory),
-			first.settings.maxEntriesPerScan,
-		);
-	}
-
 	private async prepare(
 		input: ProcessRecordingInput,
-		knownMarkers: ReadonlySet<string>,
 	): Promise<PreparedRecording | 'skipped'> {
 		const { candidate, reportProgress } = input;
 		assertNotCancelled(input);
 		// A file whose name, size, and modification time match a previously
 		// recorded state was already verified stable and hashed, so both the
 		// stability wait and the full read can be skipped.
-		const fingerprintMatch = input.findStateByFingerprint?.(candidate);
+		const fingerprintMatch =
+			input.knownHash === undefined
+				? input.findStateByFingerprint?.(candidate)
+				: undefined;
 		let hash: string;
-		if (fingerprintMatch === undefined) {
+		if (input.knownHash !== undefined) {
+			hash = input.knownHash;
+		} else if (fingerprintMatch === undefined) {
 			reportProgress({
 				stage: 'stabilizing',
 				message: `Checking that ${candidate.fileName} is stable…`,
@@ -639,17 +602,22 @@ export class RecordingProcessor {
 			hash = fingerprintMatch.hash;
 		}
 		const existingState = input.findState(hash);
-		const marker = `sha256:${hash}`;
-		if (existingState?.stage === 'complete' && knownMarkers.has(marker)) {
-			if (fingerprintMatch === undefined) {
+		if (
+			existingState?.stage === 'complete' ||
+			(existingState?.stage === 'failed' && input.retryFailed !== true)
+		) {
+			if (fingerprintMatch === undefined && input.knownHash === undefined) {
 				input.recordFingerprint?.(existingState, candidate);
 			}
-			await discardArchivedAudio(input, existingState);
+			if (existingState.stage === 'complete') {
+				await discardArchivedAudio(input, existingState);
+			}
 			return 'skipped';
 		}
 		const artifactRoot = resolve(input.artifactRoot);
 		const recordingRoot = join(artifactRoot, hash.slice(0, 2), hash);
 		await mkdir(recordingRoot, { recursive: true, mode: 0o700 });
+		await removeStaleTemporaries(recordingRoot);
 		const archivedAudio = restoreArtifactPath(
 			input.vaultRoot,
 			artifactRoot,
@@ -683,14 +651,12 @@ export class RecordingProcessor {
 			fileName: candidate.fileName,
 			size: candidate.size,
 			sourceModifiedAtMs: candidate.modifiedAtMs,
-			attempts: state.attempts + 1,
+			recordedAtMs: candidate.recordedAtMs,
+			// A manual retry of a failed recording gets a fresh attempt budget.
+			attempts: (state.stage === 'failed' ? 0 : state.attempts) + 1,
 			updatedAt: new Date().toISOString(),
 			lastError: undefined,
 		};
-		const journalRoot = resolve(
-			input.vaultRoot,
-			input.settings.journalDirectory,
-		);
 		const archivedAudioExists = await fileExists(archivedAudio);
 		const transcriptExists = await fileExists(transcriptPath);
 		const rawResponseExists = await fileExists(rawResponsePath);
@@ -706,15 +672,23 @@ export class RecordingProcessor {
 				? vaultRelative(input.vaultRoot, rawResponsePath)
 				: state.rawResponsePath,
 		};
-		if (state.stage === 'copied' && !archivedAudioExists) {
+		if (state.stage === 'failed') {
+			state = {
+				...state,
+				stage:
+					transcriptExists && rawResponseExists
+						? 'transcribed'
+						: archivedAudioExists
+							? 'copied'
+							: 'discovered',
+			};
+		} else if (state.stage === 'copied' && !archivedAudioExists) {
 			state = { ...state, stage: 'discovered' };
 		} else if (
-			(state.stage === 'transcribed' || state.stage === 'complete') &&
+			state.stage === 'transcribed' &&
 			(!transcriptExists || !rawResponseExists)
 		) {
 			state = { ...state, stage: archivedAudioExists ? 'copied' : 'discovered' };
-		} else if (state.stage === 'complete') {
-			state = { ...state, stage: 'transcribed' };
 		}
 		if (state.stage === 'transcribed') {
 			await discardArchivedAudio(input, state);
@@ -722,13 +696,16 @@ export class RecordingProcessor {
 		await input.saveState(state);
 
 		try {
+			if (candidate.size === 0) {
+				throw new PermanentRecordingError('Recording is empty.');
+			}
 			if (state.stage === 'discovered') {
 				reportProgress({
 					stage: 'copying',
 					message: `Archiving ${candidate.fileName}…`,
 					fileName: candidate.fileName,
 				});
-				await verifiedCopy(candidate.absolutePath, archivedAudio);
+				await verifiedCopy(candidate.absolutePath, archivedAudio, hash);
 				state = {
 					...state,
 					stage: 'copied',
@@ -750,7 +727,9 @@ export class RecordingProcessor {
 					archivedAudio,
 				);
 				if (transcript.text.trim() === '') {
-					throw new Error('Speech-to-text returned an empty transcript.');
+					throw new PermanentRecordingError(
+						'Speech-to-text returned an empty transcript.',
+					);
 				}
 				await atomicWrite(transcriptPath, `${transcript.text.trim()}\n`);
 				await atomicWrite(
@@ -784,10 +763,16 @@ export class RecordingProcessor {
 			) {
 				throw new Error('Recording preparation did not produce a transcript.');
 			}
-			return { input, hash, state, marker, journalRoot };
+			return {
+				input,
+				hash,
+				state,
+				resumed: state.agentStartedAt !== undefined,
+			};
 		} catch (error) {
 			await input.saveState({
 				...state,
+				stage: failureStage(input, state, error),
 				updatedAt: new Date().toISOString(),
 				lastError: errorMessage(error),
 			});
@@ -854,22 +839,29 @@ export class RecordingProcessor {
 				throw new Error('ffmpeg did not produce any audio segments.');
 			}
 			const results: TranscriptionResult[] = [];
+			const stem = basename(
+				input.candidate.fileName,
+				extname(input.candidate.fileName),
+			);
 			for (const [index, chunkPath] of chunkPaths.entries()) {
 				assertNotCancelled(input);
-				const chunkLabel =
-					chunkPaths.length === 1
-						? input.candidate.fileName
-						: `${input.candidate.fileName} (part ${(index + 1).toString()}/${chunkPaths.length.toString()})`;
+				const part = (index + 1).toString();
 				if (chunkPaths.length > 1) {
 					input.reportProgress({
 						stage: 'transcribing',
-						message: `Transcribing ${chunkLabel}…`,
+						message: `Transcribing ${input.candidate.fileName} (part ${part}/${chunkPaths.length.toString()})…`,
 						fileName: input.candidate.fileName,
 					});
 				}
-				results.push(await this.transcribeFile(input, chunkPath, chunkLabel));
+				// The upload name keeps a real extension: servers infer the audio
+				// format from it.
+				const uploadFileName =
+					chunkPaths.length === 1
+						? input.candidate.fileName
+						: `${stem}.part${part}${extname(chunkPath)}`;
+				results.push(await this.transcribeFile(input, chunkPath, uploadFileName));
 			}
-			return combineTranscriptionResults(results);
+			return combineTranscriptionResults(results, chunkSeconds);
 		} finally {
 			await rm(chunkDir, { recursive: true, force: true }).catch(() => undefined);
 		}
@@ -881,10 +873,14 @@ export class RecordingProcessor {
 		uploadFileName: string,
 	): Promise<TranscriptionResult> {
 		const audio = await readFile(filePath);
-		const audioBuffer = audio.buffer.slice(
-			audio.byteOffset,
-			audio.byteOffset + audio.byteLength,
-		);
+		// Large reads get their own backing buffer; only copy pooled slices.
+		const audioBuffer =
+			audio.byteOffset === 0 && audio.byteLength === audio.buffer.byteLength
+				? audio.buffer
+				: audio.buffer.slice(
+						audio.byteOffset,
+						audio.byteOffset + audio.byteLength,
+					);
 		return await this.transcriber.transcribe(input.sttBaseUrl, {
 			audio: audioBuffer,
 			fileName: uploadFileName,
@@ -919,11 +915,11 @@ export class RecordingProcessor {
 			additionalInstructions: input.settings.additionalAgentInstructions,
 			recordings: prepared.map((recording) => ({
 				fileName: recording.input.candidate.fileName,
-				sourceHash: recording.hash,
 				recordedAt: formatLocalTimestamp(
 					recording.input.candidate.recordedAtMs,
 				),
 				transcriptPath: recording.state.transcriptPath ?? '',
+				resumed: recording.resumed,
 			})),
 		});
 		assertNotCancelled(input);
@@ -931,6 +927,13 @@ export class RecordingProcessor {
 			input.vaultRoot,
 			input.artifactRoot,
 		);
+		// Persisted before the agent starts, so a crash mid-run is visible to the
+		// next attempt, which then tells the agent to check for partial edits.
+		const agentStartedAt = new Date().toISOString();
+		for (const recording of prepared) {
+			recording.state = { ...recording.state, agentStartedAt };
+			await recording.input.saveState(recording.state);
+		}
 		const agentFailure = await this.runAgentTurn({
 			settings: input.settings,
 			vaultRoot: input.vaultRoot,
@@ -945,12 +948,18 @@ export class RecordingProcessor {
 				});
 			},
 		});
+		let changedPaths: string[] | undefined;
 		try {
 			const snapshotAfter = await snapshotVaultNotes(
 				input.vaultRoot,
 				input.artifactRoot,
+				snapshotBefore,
 			);
-			const changes = compareVaultSnapshots(snapshotBefore, snapshotAfter);
+			const changes = compareVaultSnapshots(
+				snapshotBefore.snapshot,
+				snapshotAfter.snapshot,
+			);
+			changedPaths = changes.map((change) => change.path);
 			if (changes.length > 0) {
 				input.reportActivity?.({
 					kind: 'changes',
@@ -971,30 +980,6 @@ export class RecordingProcessor {
 				stage: 'editing-vault',
 			});
 		}
-		try {
-			const cacheResult = await pruneArtifactCache(
-				input.artifactRoot,
-				input.settings.artifactCacheMaxMb * 1024 * 1024,
-				new Set(prepared.map((recording) => recording.hash)),
-			);
-			if (cacheResult.deletedDirectories.length > 0) {
-				input.reportActivity?.({
-					kind: 'pipeline',
-					level: 'info',
-					title: 'Artifact cache pruned',
-					message: `${cacheResult.deletedDirectories.length.toString()} old recording artifact(s) removed.`,
-					stage: 'editing-vault',
-				});
-			}
-		} catch (error) {
-			input.reportActivity?.({
-				kind: 'pipeline',
-				level: 'warning',
-				title: 'Artifact cache cleanup failed',
-				message: errorMessage(error),
-				stage: 'editing-vault',
-			});
-		}
 		if (agentFailure !== undefined) {
 			const failure =
 				agentFailure instanceof Error
@@ -1004,35 +989,36 @@ export class RecordingProcessor {
 			throw failure;
 		}
 
-		const presentMarkers = await collectJournalSourceMarkers(
-			primary.journalRoot,
-			primary.input.settings.maxEntriesPerScan,
-		);
-		const missingMarkers = prepared.filter(
-			(recording) => !presentMarkers.has(recording.marker),
-		);
-		if (missingMarkers.length > 0) {
-			const error = new Error(
-				missingMarkers.length === 1
-					? 'Coding agent exited successfully but did not write the required source metadata.'
-					: `Coding agent exited successfully but did not write ${missingMarkers.length.toString()} required source metadata values.`,
-			);
-			await this.saveBatchFailure(prepared, error);
-			throw error;
-		}
-
+		const completedAt = new Date().toISOString();
 		for (const recording of prepared) {
 			await recording.input.saveState({
 				...recording.state,
 				stage: 'complete',
-				updatedAt: new Date().toISOString(),
+				agentStartedAt: undefined,
+				completedAt,
+				notePaths: changedPaths,
+				lastError: undefined,
+				updatedAt: completedAt,
 			});
+		}
+		if (changedPaths?.length === 0) {
+			input.reportActivity?.({
+				kind: 'agent',
+				level: 'warning',
+				title: 'No notes changed',
+				message: `${codingAgentName(input.settings.codingAgentType)} finished without changing any note for ${batchLabel}.`,
+				stage: 'complete',
+			});
+			return;
 		}
 		input.reportActivity?.({
 			kind: 'agent',
 			level: 'success',
 			title: 'Vault update complete',
-			message: `Verified ${prepared.length.toString()} frontmatter source value(s) in the journal.`,
+			message:
+				changedPaths === undefined
+					? `Processed ${batchLabel}.`
+					: `Processed ${batchLabel}; ${changedPaths.length.toString()} note(s) changed.`,
 			presentation: 'event',
 			icon: 'circle-check',
 			status: 'succeeded',
@@ -1047,6 +1033,7 @@ export class RecordingProcessor {
 		for (const recording of prepared) {
 			await recording.input.saveState({
 				...recording.state,
+				stage: failureStage(recording.input, recording.state, error),
 				updatedAt: new Date().toISOString(),
 				lastError: errorMessage(error),
 			});
@@ -1062,7 +1049,9 @@ export class RecordingProcessor {
 		followUpMessage: string;
 		reportActivity?: (event: NewActivityEvent) => void;
 		reportProgress?: ReportProgress;
-	}): Promise<{ agentFailure: unknown; snapshotAfter: VaultSnapshot }> {
+		/** The caller's pre-agent snapshot; files unchanged since it need no re-read. */
+		reuseSnapshot?: VaultSnapshotResult;
+	}): Promise<{ agentFailure: unknown; snapshotAfter: VaultSnapshotResult }> {
 		const prompt = buildFollowUpAgentPrompt({
 			journalDirectory: input.settings.journalDirectory,
 			additionalInstructions: input.settings.additionalAgentInstructions,
@@ -1089,6 +1078,7 @@ export class RecordingProcessor {
 		const snapshotAfter = await snapshotVaultNotes(
 			input.vaultRoot,
 			input.artifactRoot,
+			input.reuseSnapshot,
 		);
 		return { agentFailure, snapshotAfter };
 	}

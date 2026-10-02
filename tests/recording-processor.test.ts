@@ -139,7 +139,7 @@ describe('RecordingProcessor', () => {
 		]);
 	});
 
-	it('does not launch the agent when any recording in a group fails', async () => {
+	it('still journals the rest of a group when one recording fails', async () => {
 		const input = await fixture();
 		const secondPath = join(
 			dirname(input.candidate.absolutePath),
@@ -168,7 +168,12 @@ describe('RecordingProcessor', () => {
 				};
 			},
 		);
-		const run = vi.fn(async () => ({ stdout: '', stderr: '' }));
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
+				stdout: '',
+				stderr: '',
+			}),
+		);
 		const states: Record<string, RecordingState> = {};
 		const common = {
 			settings: input.settings,
@@ -191,17 +196,18 @@ describe('RecordingProcessor', () => {
 			{ ...common, candidate: secondCandidate },
 		]);
 
-		expect(run).not.toHaveBeenCalled();
-		expect(outcomes).toHaveLength(1);
-		expect(outcomes[0]).toMatchObject({
-			candidate: secondCandidate,
-			result: 'failed',
-		});
+		expect(run).toHaveBeenCalledOnce();
+		expect(run.mock.calls[0]?.[2]).toContain(input.candidate.fileName);
+		expect(run.mock.calls[0]?.[2]).not.toContain(secondCandidate.fileName);
+		expect(outcomes).toEqual([
+			expect.objectContaining({ candidate: secondCandidate, result: 'failed' }),
+			expect.objectContaining({ candidate: input.candidate, result: 'processed' }),
+		]);
 		expect(
 			Object.values(states).find(
 				(state) => state.fileName === input.candidate.fileName,
 			),
-		).toMatchObject({ stage: 'transcribed' });
+		).toMatchObject({ stage: 'complete', notePaths: [] });
 		expect(
 			Object.values(states).find(
 				(state) => state.fileName === secondCandidate.fileName,
@@ -288,7 +294,10 @@ describe('RecordingProcessor', () => {
 				],
 			}),
 		);
-		expect(run.mock.calls[0]?.[2]).toContain(`"sha256:${state?.hash ?? ''}"`);
+		expect(run.mock.calls[0]?.[2]).not.toContain('sha256:');
+		expect(state?.notePaths).toEqual(['Journal/entry.md']);
+		expect(state?.completedAt).toBeDefined();
+		expect(state?.agentStartedAt).toBeUndefined();
 		expect(run.mock.calls[0]?.[2]).toMatch(
 			/^You are editing an existing Obsidian vault/u,
 		);
@@ -313,7 +322,6 @@ describe('RecordingProcessor', () => {
 			recordings: [
 				{
 					fileName: 'recording.wav',
-					sourceHash: 'abc123',
 					recordedAt: '2026-09-21T09:00:00.000+09:00',
 					transcriptPath: 'Journal/.voice-journal/raw-transcript.txt',
 				},
@@ -332,7 +340,10 @@ describe('RecordingProcessor', () => {
 		expect(prompt).toContain('target before the |');
 		expect(prompt).toContain('only one literal display form');
 		expect(prompt).toContain('Never search inside .voice-journal');
-		expect(prompt).toContain('only inside "Journal"');
+		expect(prompt).toContain('The recording time is a hint, not a rule');
+		expect(prompt).toContain('shortly after midnight usually describes the previous day');
+		expect(prompt).toContain('Do not record voice-journal provenance');
+		expect(prompt).not.toContain('previous attempt');
 		expect(prompt).toContain('create the appropriate Poncle note');
 		expect(prompt).toContain('enrich relevant existing notes');
 		expect(prompt).toContain('representative set of nearby and recent');
@@ -340,7 +351,7 @@ describe('RecordingProcessor', () => {
 		expect(prompt).toContain('Write natural English');
 		expect(prompt).toContain('Avoid AI mannerisms, em dashes');
 		expect(prompt).toContain('LinkedIn-style embellishment');
-		expect(prompt).toContain('voice_journal_sources');
+		expect(prompt).not.toContain('voice_journal_sources');
 		expect(prompt).toContain('do not add an H1 containing the same date');
 	});
 
@@ -436,7 +447,7 @@ describe('RecordingProcessor', () => {
 		);
 		const transcribe = vi.fn(
 			async (_baseUrl: string, request: { fileName: string }) => ({
-				text: request.fileName.includes('part 1')
+				text: request.fileName.includes('.part1.')
 					? 'First half.'
 					: 'Second half.',
 				segments: [{ id: 'seg-0001', start: 0, end: 1, text: 'chunk' }],
@@ -501,6 +512,10 @@ describe('RecordingProcessor', () => {
 			'utf8',
 		);
 		expect(transcriptContents.trim()).toBe('First half.\n\nSecond half.');
+		expect(transcribe.mock.calls.map((call) => call[1].fileName)).toEqual([
+			'TX01_MIC001_20260921_190000_orig.part1.wav',
+			'TX01_MIC001_20260921_190000_orig.part2.wav',
+		]);
 		await expect(stat(chunkDir)).rejects.toThrow();
 	});
 
@@ -689,7 +704,12 @@ describe('RecordingProcessor', () => {
 
 	it('does not probe or split when splitting is switched off', async () => {
 		const input = await fixture();
-		const run = vi.fn(async () => ({ stdout: '', stderr: '' }));
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
+				stdout: '',
+				stderr: '',
+			}),
+		);
 		const transcribe = vi.fn(async () => ({
 			text: 'Whole file transcript.',
 			segments: [],
@@ -717,66 +737,19 @@ describe('RecordingProcessor', () => {
 		expect(transcribe).toHaveBeenCalledTimes(1);
 	});
 
-	it('does not mark an exit-zero agent run complete without source metadata', async () => {
+	it('completes an exit-zero agent run that changed no notes, with a warning', async () => {
 		const input = await fixture();
-		const transcribe = vi.fn(async () => ({
-			text: 'No marker yet.',
-			segments: [],
-			rawResponse: { text: 'No marker yet.' },
-		}));
-		const run = vi.fn(
-			async (
-				_settings: VoiceJournalSettings,
-				_vaultPath: string,
-				_prompt: string,
-			) => ({ stdout: 'claimed success', stderr: '' }),
-		);
+		const run = vi.fn(async () => ({ stdout: 'nothing to add', stderr: '' }));
 		const states: Record<string, RecordingState> = {};
-
-		await expect(
-			new RecordingProcessor({ transcribe }, { run }, 0).process({
-				...input,
-				sttBaseUrl: 'http://localhost:8001/v1',
-				findState: (hash) => states[hash],
-				saveState: async (state) => {
-					states[state.hash] = state;
-				},
-				reportProgress: () => undefined,
-			}),
-		).rejects.toThrow(/source metadata/i);
-		expect(Object.values(states)[0]).toMatchObject({
-			stage: 'transcribed',
-			lastError:
-				'Coding agent exited successfully but did not write the required source metadata.',
-		});
-	});
-
-	it('rejects HTML provenance comments', async () => {
-		const input = await fixture();
-		const states: Record<string, RecordingState> = {};
-		const run = vi.fn(
-			async (
-				_settings: VoiceJournalSettings,
-				vaultPath: string,
-				prompt: string,
-			) => {
-				const source = sourceValuesFromPrompt(prompt)[0] ?? '';
-				await mkdir(join(vaultPath, 'Journal'), { recursive: true });
-				await writeFile(
-					join(vaultPath, 'Journal', 'comment.md'),
-					`Entry\n\n<!-- voice-journal-source: ${source.replaceAll('"', '')} -->\n`,
-				);
-				return { stdout: '', stderr: '' };
-			},
-		);
+		const activity: NewActivityEvent[] = [];
 
 		await expect(
 			new RecordingProcessor(
 				{
 					transcribe: async () => ({
-						text: 'Transcript.',
+						text: 'Already covered.',
 						segments: [],
-						rawResponse: { text: 'Transcript.' },
+						rawResponse: { text: 'Already covered.' },
 					}),
 				},
 				{ run },
@@ -789,8 +762,137 @@ describe('RecordingProcessor', () => {
 					states[state.hash] = state;
 				},
 				reportProgress: () => undefined,
+				reportActivity: (event) => activity.push(event),
 			}),
-		).rejects.toThrow(/source metadata/iu);
+		).resolves.toBe('processed');
+		expect(Object.values(states)[0]).toMatchObject({
+			stage: 'complete',
+			notePaths: [],
+		});
+		expect(activity).toContainEqual(
+			expect.objectContaining({ level: 'warning', title: 'No notes changed' }),
+		);
+	});
+
+	it('marks a recording with an empty transcript as permanently failed', async () => {
+		const input = await fixture();
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
+				stdout: '',
+				stderr: '',
+			}),
+		);
+		const states: Record<string, RecordingState> = {};
+		const processor = new RecordingProcessor(
+			{
+				transcribe: async () => ({
+					text: '  ',
+					segments: [],
+					rawResponse: { text: '' },
+				}),
+			},
+			{ run },
+			0,
+		);
+		const process = async (retryFailed = false) =>
+			await processor.process({
+				...input,
+				sttBaseUrl: 'http://localhost:8001/v1',
+				findState: (hash) => states[hash],
+				saveState: async (state) => {
+					states[state.hash] = state;
+				},
+				reportProgress: () => undefined,
+				retryFailed,
+			});
+
+		await expect(process()).rejects.toThrow(/empty transcript/u);
+		expect(Object.values(states)[0]).toMatchObject({ stage: 'failed' });
+		expect(await process()).toBe('skipped');
+		// A manual pick retries it with a fresh attempt budget.
+		await expect(process(true)).rejects.toThrow(/empty transcript/u);
+		expect(Object.values(states)[0]).toMatchObject({ attempts: 1 });
+		expect(run).not.toHaveBeenCalled();
+	});
+
+	it('gives up on a recording after repeated transient failures', async () => {
+		const input = await fixture();
+		const states: Record<string, RecordingState> = {};
+		const processor = new RecordingProcessor(
+			{
+				transcribe: async () => {
+					throw new Error('Gateway timeout.');
+				},
+			},
+			{ run: async () => ({ stdout: '', stderr: '' }) },
+			0,
+		);
+		for (let attempt = 1; attempt <= 5; attempt += 1) {
+			await expect(
+				processor.process({
+					...input,
+					sttBaseUrl: 'http://localhost:8001/v1',
+					findState: (hash) => states[hash],
+					saveState: async (state) => {
+						states[state.hash] = state;
+					},
+					reportProgress: () => undefined,
+				}),
+			).rejects.toThrow(/Gateway timeout/u);
+			expect(Object.values(states)[0]?.stage).toBe(
+				attempt < 5 ? 'copied' : 'failed',
+			);
+		}
+	});
+
+	it('warns the agent when a previous run for the recording was interrupted', async () => {
+		const input = await fixture();
+		const states: Record<string, RecordingState> = {};
+		const save = async (state: RecordingState) => {
+			states[state.hash] = state;
+		};
+		const transcribe = async () => ({
+			text: 'Went hiking.',
+			segments: [],
+			rawResponse: { text: 'Went hiking.' },
+		});
+		// Simulate a crash: the agent started but the run never finished.
+		await expect(
+			new RecordingProcessor(
+				{ transcribe },
+				{
+					run: async () => {
+						throw new Error('Obsidian closed.');
+					},
+				},
+				0,
+			).process({
+				...input,
+				sttBaseUrl: 'http://localhost:8001/v1',
+				findState: (hash) => states[hash],
+				saveState: save,
+				reportProgress: () => undefined,
+			}),
+		).rejects.toThrow();
+		expect(Object.values(states)[0]?.agentStartedAt).toBeDefined();
+
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
+				stdout: '',
+				stderr: '',
+			}),
+		);
+		await new RecordingProcessor({ transcribe }, { run }, 0).process({
+			...input,
+			sttBaseUrl: 'http://localhost:8001/v1',
+			findState: (hash) => states[hash],
+			saveState: save,
+			reportProgress: () => undefined,
+		});
+		expect(run.mock.calls[0]?.[2]).toContain(
+			'A previous attempt to process this recording was interrupted',
+		);
+		expect(Object.values(states)[0]?.agentStartedAt).toBeUndefined();
 	});
 
 	it('allows Pi to recover from consecutive tool failures', async () => {
@@ -857,7 +959,12 @@ describe('RecordingProcessor', () => {
 				rawResponse: { text: 'Keep this completed transcript for the retry.' },
 			};
 		});
-		const run = vi.fn(async () => ({ stdout: '', stderr: '' }));
+		const run = vi.fn(
+			async (_settings: VoiceJournalSettings, _vaultPath: string, _prompt: string) => ({
+				stdout: '',
+				stderr: '',
+			}),
+		);
 		const states: Record<string, RecordingState> = {};
 
 		await expect(
@@ -949,7 +1056,7 @@ describe('RecordingProcessor', () => {
 		expect(capturedPrompt).toContain('Journal/2026-03-31.md');
 		expect(capturedPrompt).toContain('Mention that it was raining.');
 		expect(result.agentFailure).toBeUndefined();
-		expect(result.snapshotAfter.get('Journal/2026-03-31.md')).toBe(
+		expect(result.snapshotAfter.snapshot.get('Journal/2026-03-31.md')).toBe(
 			'first pass, now revised\n',
 		);
 		expect(progress.some((update) => update.stage === 'editing-vault')).toBe(true);

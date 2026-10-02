@@ -1,10 +1,8 @@
-import { spawn } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
-import {
-	clearTimeout as cancelTimeout,
-	setTimeout as scheduleTimeout,
-} from 'node:timers';
+import { describeTermination, runProcess } from '../process/run-process';
+import type { OutputRetention } from '../process/run-process';
+import { spawnEnvironment } from '../process/spawn-environment';
 
 export interface AudioSplitter {
 	probeDurationSeconds(
@@ -21,6 +19,7 @@ export interface AudioSplitter {
 
 export interface FfmpegResult {
 	code: number | null;
+	signal?: NodeJS.Signals | null;
 	stderr: string;
 	timedOut: boolean;
 }
@@ -42,41 +41,40 @@ export function parseFfmpegDuration(stderr: string): number | null {
 	);
 }
 
-function runFfmpeg(
+// Metadata-heavy inputs (chapters, embedded lyrics, many streams) can print
+// a lot, but the Duration line always comes first, so the probe keeps the
+// head of stderr while failures keep the tail where ffmpeg reports errors.
+const MAX_STDERR_CHARS = 64 * 1024;
+
+export async function runFfmpeg(
 	executable: string,
 	args: string[],
 	timeoutMs: number,
+	stderrRetention: OutputRetention = 'tail',
 ): Promise<FfmpegResult> {
-	return new Promise((resolvePromise, reject) => {
-		let stderr = '';
-		let timedOut = false;
-		const child = spawn(executable, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-		const timer =
-			timeoutMs > 0
-				? scheduleTimeout(() => {
-						timedOut = true;
-						child.kill('SIGKILL');
-					}, timeoutMs)
-				: undefined;
-		child.stderr?.on('data', (chunk: string | Buffer) => {
-			stderr += chunk.toString();
-			if (stderr.length > 8_000) {
-				stderr = stderr.slice(-8_000);
-			}
-		});
-		child.once('error', (error) => {
-			if (timer !== undefined) {
-				cancelTimeout(timer);
-			}
-			reject(error);
-		});
-		child.once('close', (code) => {
-			if (timer !== undefined) {
-				cancelTimeout(timer);
-			}
-			resolvePromise({ code, stderr, timedOut });
-		});
+	const result = await runProcess(executable, args, {
+		env: await spawnEnvironment(executable),
+		timeoutMs,
+		captureStdout: false,
+		maxOutputChars: MAX_STDERR_CHARS,
+		stderrRetention,
+		// ffmpeg ignores the first SIGTERM while it finalises output, so it
+		// is not given long before the SIGKILL.
+		killGraceMs: 1_000,
 	});
+	return {
+		code: result.code,
+		signal: result.signal,
+		stderr: result.stderr,
+		timedOut: result.timedOut,
+	};
+}
+
+// The segment muxer expands printf-style `%` sequences in the whole output
+// path, so literal percent signs in the directory or file name are doubled.
+export function segmentOutputPattern(outputDir: string, extension: string): string {
+	const escape = (text: string): string => text.replace(/%/gu, '%%');
+	return join(escape(outputDir), `chunk-%04d${escape(extension)}`);
 }
 
 export class FfmpegAudioSplitter implements AudioSplitter {
@@ -95,6 +93,7 @@ export class FfmpegAudioSplitter implements AudioSplitter {
 			ffmpegExecutable,
 			['-hide_banner', '-nostdin', '-i', inputPath],
 			this.timeoutMs,
+			'head',
 		);
 		if (result.timedOut) {
 			throw new Error(`ffmpeg timed out reading ${inputPath}.`);
@@ -108,7 +107,7 @@ export class FfmpegAudioSplitter implements AudioSplitter {
 		chunkSeconds: number,
 		ffmpegExecutable: string,
 	): Promise<string[]> {
-		const pattern = join(outputDir, `chunk-%04d${extname(inputPath)}`);
+		const pattern = segmentOutputPattern(outputDir, extname(inputPath));
 		const result = await this.run(
 			ffmpegExecutable,
 			[
@@ -119,6 +118,11 @@ export class FfmpegAudioSplitter implements AudioSplitter {
 				'-y',
 				'-i',
 				inputPath,
+				// Only the first audio stream is segmented: embedded cover art
+				// and other streams cannot be stream-copied into every chunk.
+				'-map',
+				'0:a:0',
+				'-vn',
 				'-f',
 				'segment',
 				'-segment_time',
@@ -132,11 +136,20 @@ export class FfmpegAudioSplitter implements AudioSplitter {
 			this.timeoutMs,
 		);
 		if (result.timedOut || result.code !== 0) {
-			const reason = result.timedOut
-				? `timed out after ${this.timeoutMs.toString()} ms`
-				: result.stderr.trim().slice(-2_000) ||
-					`exit code ${result.code?.toString() ?? 'unknown'}`;
-			throw new Error(`ffmpeg failed to split the recording: ${reason}`);
+			const reason = describeTermination(
+				{
+					code: result.code,
+					signal: result.signal ?? null,
+					timedOut: result.timedOut,
+				},
+				this.timeoutMs,
+			);
+			const diagnostic = result.stderr.trim().slice(-2_000);
+			throw new Error(
+				diagnostic === ''
+					? `ffmpeg failed to split the recording (${reason}).`
+					: `ffmpeg failed to split the recording (${reason}): ${diagnostic}`,
+			);
 		}
 		const entries = await readdir(outputDir);
 		return entries
