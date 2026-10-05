@@ -4,6 +4,8 @@ Imports voice recordings into Obsidian, transcribes them with a configured speec
 
 The plugin does the mechanical work: it scans recording sources, waits for a stable file, deduplicates by content hash, copies the audio, transcribes it, and runs the selected agent. The agent does the semantic work: it cleans the transcript, inspects your vault, links existing notes, and creates or updates entries.
 
+![Voice Journal panel after a completed run, with vault changes to accept or revert above the agent's activity timeline](docs/voice-journal.png)
+
 ## Requirements
 
 - Obsidian 1.13.0 or newer, on desktop.
